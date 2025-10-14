@@ -1532,7 +1532,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
             f"• Этаж: {f.stage}\n"
             f"• Площадь: {f.sq_m} м²\n"
             f"• Цена: {f.price} $\n"
-            f"• Подъезд: {f.lobby}\n"
+            f"• Подъезд: {f.lobby}\n\n"
             f"{f.description}\n\n"
             "С вами свяжется менеджер для уточнения деталей. 🏙"
         )
