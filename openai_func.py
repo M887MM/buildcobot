@@ -12,7 +12,7 @@
 
 # # === Инициализация ===
 # load_dotenv()
-# client = OpenAI(api_key=os.getenv("API_KEY"))
+# openai = OpenAI(api_key=os.getenv("API_KEY"))
 # logger = logging.getLogger(__name__)
 
 # # === Хранилища данных ===
@@ -56,7 +56,7 @@
 #     """
 
 #     try:
-#         response = client.chat.completions.create(
+#         response = openai.chat.completions.create(
 #             model="gpt-5-nano",
 #             messages=[{"role": "user", "content": prompt}],
 #         )
@@ -856,25 +856,59 @@
 import os
 import json
 import logging
+import re
 from collections import defaultdict
 from dotenv import load_dotenv
-from openai import OpenAI
 from db import Session, Flats as DBFlats
 from urllib.parse import urlsplit, urlunsplit, quote
-from aiogram import Bot  # для передачи бота
+from aiogram import Bot
 import asyncio
+import openai
 
 # === Инициализация ===
 load_dotenv()
-client = OpenAI(api_key=os.getenv("API_KEY"))
+openai.api_key = os.getenv("API_KEY")
 logger = logging.getLogger(__name__)
 
 # === Кэши ===
 user_conversations = defaultdict(list)
 last_filters_cache = {}
 shown_flats_cache = defaultdict(set)
-
 SUPPORTED_LANGS = {"ru", "uz", "en", "kk"}
+
+
+# === РЕЗЕРВНЫЙ ПАРСЕР (если GPT не справился) ===
+def fallback_parse_filters(text: str) -> dict:
+    """
+    Простейший резервный парсер для запросов вида:
+    '1 комнатная квартира на 8 этаже до 50000$'
+    """
+    filters = {}
+
+    # Кол-во комнат
+    rooms_match = re.search(r'(\d+)\s*комнат', text, re.IGNORECASE)
+    if rooms_match:
+        filters['rooms'] = int(rooms_match.group(1))
+
+    # Этаж
+    floor_match = re.search(r'(\d+)\s*(?:этаж|этаже)', text, re.IGNORECASE)
+    if floor_match:
+        filters['stage'] = int(floor_match.group(1))
+
+    # Цена
+    price_match = re.search(r'(\d+[.,]?\d*)\s*(?:\$|доллар|тыс)', text, re.IGNORECASE)
+    if price_match:
+        filters['price_max'] = float(price_match.group(1).replace(',', '.'))
+
+    # Тип недвижимости
+    if 'магазин' in text.lower():
+        filters['type'] = 'Магазин'
+    elif 'студ' in text.lower():
+        filters['type'] = 'Студия'
+    else:
+        filters['type'] = 'Квартира'
+
+    return filters
 
 
 # === Утилита для URL ===
@@ -890,9 +924,6 @@ def normalize_url(url: str) -> str:
 
 # === Вспомогательная функция: статус “печатает...” ===
 async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
-    """
-    Показывает статус 'печатает...' указанное количество секунд.
-    """
     try:
         end_time = asyncio.get_event_loop().time() + duration
         while asyncio.get_event_loop().time() < end_time:
@@ -910,7 +941,7 @@ Detect the language of this text and respond ONLY with:
 ru, en, uz, or kk.
 Text: "{text}"
 """
-        resp = client.chat.completions.create(
+        resp = openai.chat.completions.create(
             model="gpt-5-nano",
             messages=[{"role": "user", "content": prompt}],
         )
@@ -939,17 +970,18 @@ Respond ONLY with JSON, no explanation.
 Example:
 {{"type": "Квартира", "rooms": 2, "price_max": 50000}}
 """
-        resp = client.chat.completions.create(
+        resp = openai.chat.completions.create(
             model="gpt-5-nano",
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.choices[0].message.content.strip()
         data = json.loads(raw)
         if isinstance(data, dict):
+            logger.info(f"✅ GPT parsed filters: {data}")
             return data
         return {}
     except Exception as e:
-        logger.warning(f"Ошибка парсинга фильтров GPT: {e}")
+        logger.warning(f"⚠️ Ошибка парсинга фильтров GPT: {e}")
         return {}
 
 
@@ -957,13 +989,15 @@ Example:
 async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int = None):
     """
     Основная функция подбора квартир.
-    Добавлено: отображение статуса "печатает..." при каждом важном шаге.
+    GPT-5-nano — основной парсер фильтров.
+    Fallback-парсер используется, если GPT не справился.
     """
+    print('\n\nUSER MESSAGE:', text, '\n\n')
     text = text.strip()
     if not text:
         return {"text": "❗ Пустой запрос"}
 
-    # 🔸 Показываем статус "печатает..." перед началом обработки
+    # 🔸 Показываем статус "печатает..."
     if bot and chat_id:
         asyncio.create_task(show_typing(bot, chat_id, duration=5))
 
@@ -971,8 +1005,16 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     lang = detect_language(text)
     user_conversations[user_id].append({"role": "user", "content": text})
 
-    # --- Получаем фильтры от GPT ---
+    # --- Пытаемся получить фильтры от GPT ---
     filters = extract_filters_with_gpt(text)
+
+    # --- Если GPT не справился, пробуем fallback ---
+    if not filters:
+        filters = fallback_parse_filters(text)
+        if filters:
+            logger.info(f"⚙️ GPT не вернул фильтры, fallback сработал: {filters}")
+
+    # --- Если всё ещё пусто ---
     if not filters:
         msg = {
             "ru": "Пожалуйста, уточните хотя бы одно пожелание 💬",
@@ -986,11 +1028,11 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     last_filters_cache[user_id] = filters
     shown_flats_cache[user_id].clear()
 
-    # 🔸 Показываем статус "печатает..." при запросе из базы
+    # 🔸 Показываем статус "печатает..." при поиске
     if bot and chat_id:
         asyncio.create_task(show_typing(bot, chat_id, duration=5))
 
-    # --- Получаем из базы ---
+    # --- Поиск в БД ---
     session = Session()
     query = session.query(DBFlats)
 
@@ -1010,10 +1052,6 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     flats = query.filter(DBFlats.status == "Свободно").all()
     session.close()
 
-    # 🔸 Показываем статус "печатает..." перед ответом пользователю
-    if bot and chat_id:
-        asyncio.create_task(show_typing(bot, chat_id, duration=5))
-
     # --- Если ничего не найдено ---
     if not flats:
         msg = {
@@ -1024,7 +1062,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
         }[lang]
         return {"text": msg}
 
-    # --- Отображаем результаты ---
+    # --- Выбор новых квартир ---
     seen = shown_flats_cache[user_id]
     new_flats = [f for f in flats if f.number not in seen][:4]
     if not new_flats:
@@ -1033,6 +1071,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     for f in new_flats:
         seen.add(f.number)
 
+    # --- Формируем ответы ---
     results = []
     for f in new_flats:
         text_base = (
@@ -1042,14 +1081,14 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
             f"• Площадь: {f.sq_m} м²\n"
             f"• Цена: {f.price} $\n"
             f"• Подъезд: {f.lobby}\n"
-            F"{f.description}"
+            f"{f.description}\n\n"
             "С вами свяжется менеджер для уточнения деталей. 🏙"
         )
 
-        # Переводим описание при необходимости
+        # Перевод описания, если язык не русский
         if lang != "ru":
             try:
-                translation = client.chat.completions.create(
+                translation = openai.chat.completions.create(
                     model="gpt-5-nano",
                     messages=[
                         {
@@ -1077,13 +1116,6 @@ def clear_user(user_id: int):
 
 
 def get_formatted_dialog(user_message):
-    """
-    Форматирует запрос к OpenAI, чтобы он мог:
-    1. Определить язык пользователя.
-    2. Перевести запрос, если нужно.
-    3. Вернуть структурированные фильтры для поиска.
-    """
-
     system_prompt = (
         "Ты — умный фильтрующий помощник. "
         "Твоя задача: определить язык пользователя, перевести сообщение на русский, "
@@ -1102,10 +1134,7 @@ def get_formatted_dialog(user_message):
         "}"
     )
 
-    return {
-        "role": "system",
-        "content": system_prompt,
-    }, {
-        "role": "user",
-        "content": user_message,
-    }
+    return (
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    )
