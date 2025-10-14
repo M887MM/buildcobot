@@ -17,7 +17,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-from openai import OpenAI
 from collections import defaultdict
 
 from db import Session, Flats as DBFlats , Credit, Flats 

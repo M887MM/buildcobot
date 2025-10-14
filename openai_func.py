@@ -853,21 +853,476 @@
 #     shown_flats_cache.pop(user_id, None)
 #     gpt_cache.pop(user_id, None)
 
+# import os
+# import json
+# import logging
+# import re
+# import asyncio
+# from collections import defaultdict
+# from urllib.parse import urlsplit, urlunsplit, quote
+# from dotenv import load_dotenv
+# from aiogram import Bot
+# from openai import OpenAI 
+# from db import Session, Flats as DBFlats
+
+# # === Инициализация ===
+# load_dotenv()
+# client = OpenAI(api_key=os.getenv("API_KEY"))
+# logger = logging.getLogger(__name__)
+
+# # === Кэши ===
+# user_conversations = defaultdict(list)
+# last_filters_cache = {}
+# shown_flats_cache = defaultdict(set)
+# SUPPORTED_LANGS = {"ru", "uz", "en", "kk"}
+
+
+# # === Резервный парсер ===
+# def fallback_parse_filters(text: str) -> dict:
+#     filters = {}
+
+#     if match := re.search(r'(\d+)\s*комнат', text, re.IGNORECASE):
+#         filters["rooms"] = int(match.group(1))
+#     if match := re.search(r'(\d+)\s*(?:этаж|этаже)', text, re.IGNORECASE):
+#         filters["stage"] = int(match.group(1))
+#     if match := re.search(r'(\d+[.,]?\d*)\s*(?:\$|доллар|тыс)', text, re.IGNORECASE):
+#         filters["price_max"] = float(match.group(1).replace(',', '.'))
+#     if 'магазин' in text.lower():
+#         filters["type"] = "Магазин"
+#     elif 'студ' in text.lower():
+#         filters["type"] = "Студия"
+#     else:
+#         filters["type"] = "Квартира"
+
+#     return filters
+
+# # === Утилита для URL ===
+# def normalize_url(url: str) -> str:
+#     try:
+#         parts = urlsplit(url)
+#         path = quote(parts.path, safe="/%") if parts.path else ""
+#         query = quote(parts.query, safe="=&?") if parts.query else ""
+#         return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+#     except Exception:
+#         return url
+
+
+# # === Печатает... ===
+# async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
+#     try:
+#         end_time = asyncio.get_event_loop().time() + duration
+#         while asyncio.get_event_loop().time() < end_time:
+#             await bot.send_chat_action(chat_id, "typing")
+#             await asyncio.sleep(4)
+#     except Exception:
+#         pass
+
+
+# # === Определение языка ===
+# async def detect_language(text: str) -> str:
+#     try:
+#         prompt = f"""
+# Detect the language of this text and respond ONLY with one of:
+# ru, en, uz, kk.
+# Text: "{text}"
+# """
+#         resp = client.responses.create(
+#             model="gpt-5-nano",
+#             instructions=[prompt],
+#             input=text,
+#         )
+#         print('\n \n \n',"GPT LANG RAW:", resp , '\n \n \n')
+#         lang = resp.output_text.strip().lower()
+#         return lang if lang in SUPPORTED_LANGS else "ru"
+#     except Exception:
+#         return "ru"
+
+
+# # === Извлечение фильтров ===
+# async def extract_filters_with_gpt(text: str) -> dict:
+#     try:
+#         prompt = f"""
+# You are a real estate filter extractor.
+# Extract parameters from the user's request and return ONLY valid JSON.
+
+# Fields:
+# - type: "Квартира" | "Студия" | "Магазин"
+# - rooms: integer
+# - stage: integer
+# - price_max: integer
+# - price_order: "min" | "max"
+
+# User request: "{text}"
+
+# Respond ONLY with JSON, no explanation.
+# Example:
+# {{"type": "Квартира", "rooms": 2, "price_max": 50000}}
+# """
+#         resp = client.responses.create(
+#             model="gpt-5-nano",
+#             instructions=[prompt],
+#             input=text,
+#         )
+#         raw = resp.output_text.strip()
+#         print('\n \n \n',"GPT RAW:", raw , '\n \n \n')
+#         data = json.loads(raw)
+#         if isinstance(data, dict):
+#             logger.info(f"✅ GPT parsed filters: {data}")
+#             return data
+#         return {}
+#     except Exception as e:
+#         logger.warning(f"⚠️ Ошибка парсинга фильтров GPT: {e}")
+#         return {}
+
+
+# # === Основная функция ===
+# async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int = None):
+#     print("\n\nUSER MESSAGE:", text, "\n\n")
+#     text = text.strip()
+#     if not text:
+#         return {"text": "❗ Пустой запрос"}
+
+#     if bot and chat_id:
+#         asyncio.create_task(show_typing(bot, chat_id, duration=5))
+
+#     # --- Язык
+#     lang = await detect_language(text)
+#     user_conversations[user_id].append(text)
+
+#     # --- Фильтры GPT
+#     filters = await extract_filters_with_gpt(text)
+#     if not filters:
+#         filters = fallback_parse_filters(text)
+#         if filters:
+#             logger.info(f"⚙️ GPT не вернул фильтры, fallback: {filters}")
+
+#     if not filters:
+#         msg = {
+#             "ru": "Пожалуйста, уточните хотя бы одно пожелание 💬",
+#             "uz": "Iltimos, kamida bitta talabni kiriting 💬",
+#             "en": "Please specify at least one preference 💬",
+#             "kk": "Кем дегенде бір қалауыңызды көрсетіңіз 💬",
+#         }[lang]
+#         return {"text": msg}
+
+#     last_filters_cache[user_id] = filters
+#     shown_flats_cache[user_id].clear()
+
+#     if bot and chat_id:
+#         asyncio.create_task(show_typing(bot, chat_id, duration=5))
+
+#     # --- Поиск в БД
+#     session = Session()
+#     query = session.query(DBFlats)
+
+#     if filters.get("type"):
+#         query = query.filter(DBFlats.type == filters["type"])
+#     if filters.get("rooms"):
+#         query = query.filter(DBFlats.rooms == filters["rooms"])
+#     if filters.get("stage"):
+#         query = query.filter(DBFlats.stage == filters["stage"])
+#     if filters.get("price_max"):
+#         query = query.filter(DBFlats.price <= filters["price_max"])
+#     if filters.get("price_order") == "min":
+#         query = query.order_by(DBFlats.price.asc())
+#     elif filters.get("price_order") == "max":
+#         query = query.order_by(DBFlats.price.desc())
+
+#     flats = query.filter(DBFlats.status == "Свободно").all()
+#     session.close()
+
+#     if not flats:
+#         msg = {
+#             "ru": "К сожалению, объекты с такими параметрами не найдены. 🏙",
+#             "uz": "Afsuski, bunday parametrli obyektlar topilmadi. 🏙",
+#             "en": "Unfortunately, no properties match these parameters. 🏙",
+#             "kk": "Өкінішке орай, мұндай параметрлермен нысандар табылмады. 🏙",
+#         }[lang]
+#         return {"text": msg}
+
+#     seen = shown_flats_cache[user_id]
+#     new_flats = [f for f in flats if f.number not in seen][:4]
+#     if not new_flats:
+#         seen.clear()
+#         new_flats = flats[:4]
+#     for f in new_flats:
+#         seen.add(f.number)
+
+#     results = []
+#     for f in new_flats:
+#         text_base = (
+#             f"🏠 {f.type} №{f.number}\n"
+#             f"• Комнат: {f.rooms}\n"
+#             f"• Этаж: {f.stage}\n"
+#             f"• Площадь: {f.sq_m} м²\n"
+#             f"• Цена: {f.price} $\n"
+#             f"• Подъезд: {f.lobby}\n"
+#             f"{f.description}\n\n"
+#             "С вами свяжется менеджер для уточнения деталей. 🏙"
+#         )
+
+#         # Перевод описания, если язык не русский
+#         if lang != "ru":
+#             try:
+#                 translation = client.responses.create(
+#                 model="gpt-5-nano",
+#             instructions=[f"Переведи текст на {lang}, не изменяя числа и названия ЖК.",text_base],
+#             input=text,
+#                 )
+#                 text_base = translation.output_text.strip()
+#             except Exception:
+#                 pass
+
+#         photo_val = normalize_url(f.plan.strip()) if getattr(f, "plan", None) else None
+#         results.append({"text": text_base, "photo": photo_val})
+
+#     return {"flats": results}
+
+
+# # === Очистка истории ===
+# def clear_user(user_id: int):
+#     user_conversations[user_id].clear()
+#     last_filters_cache.pop(user_id, None)
+#     shown_flats_cache.pop(user_id, None)
+
+# import os
+# import json
+# import logging
+# import re
+# import asyncio
+# from collections import defaultdict
+# from urllib.parse import urlsplit, urlunsplit, quote
+# from dotenv import load_dotenv
+# from aiogram import Bot
+# from openai import OpenAI
+# from db import Session, Flats as DBFlats
+
+# # === Инициализация ===
+# load_dotenv()
+# client = OpenAI(api_key=os.getenv("API_KEY"))
+# logger = logging.getLogger(__name__)
+
+# # === Кэши ===
+# user_conversations = defaultdict(list)
+# last_filters_cache = {}
+# shown_flats_cache = defaultdict(set)
+# SUPPORTED_LANGS = {"ru", "uz", "en", "kk"}
+
+
+# # === Резервный парсер ===
+# def fallback_parse_filters(text: str) -> dict:
+#     filters = {}
+
+#     if match := re.search(r'(\d+)\s*комнат', text, re.IGNORECASE):
+#         filters["rooms"] = int(match.group(1))
+#     if match := re.search(r'(\d+)\s*(?:этаж|этаже)', text, re.IGNORECASE):
+#         filters["stage"] = int(match.group(1))
+#     if match := re.search(r'(\d+[.,]?\d*)\s*(?:\$|доллар|тыс)', text, re.IGNORECASE):
+#         filters["price_max"] = float(match.group(1).replace(',', '.'))
+#     if 'магазин' in text.lower():
+#         filters["type"] = "Магазин"
+#     elif 'студ' in text.lower():
+#         filters["type"] = "Студия"
+#     else:
+#         filters["type"] = "Квартира"
+
+#     return filters
+
+
+# # === Утилита для URL ===
+# def normalize_url(url: str) -> str:
+#     try:
+#         parts = urlsplit(url)
+#         path = quote(parts.path, safe="/%") if parts.path else ""
+#         query = quote(parts.query, safe="=&?") if parts.query else ""
+#         return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+#     except Exception:
+#         return url
+
+
+# # === Печатает... ===
+# async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
+#     try:
+#         end_time = asyncio.get_event_loop().time() + duration
+#         while asyncio.get_event_loop().time() < end_time:
+#             await bot.send_chat_action(chat_id, "typing")
+#             await asyncio.sleep(4)
+#     except Exception:
+#         pass
+
+
+# # === Определение языка ===
+# async def detect_language(text: str) -> str:
+#     try:
+#         messages = [
+#             {"role": "system", "content": "Respond ONLY with ru, en, uz, or kk."},
+#             {"role": "user", "content": f"Detect the language of this text: {text}"}
+#         ]
+#         resp = client.chat.completions.create(
+#             model="gpt-4.1-mini",
+#             messages=messages,
+#             max_tokens=5
+#         )
+#         lang = resp.choices[0].message.content.strip().lower()
+#         return lang if lang in SUPPORTED_LANGS else "ru"
+#     except Exception:
+#         return "ru"
+
+
+# # === Извлечение фильтров ===
+# async def extract_filters_with_gpt(text: str) -> dict:
+#     try:
+#         messages = [
+#             {"role": "system", "content": (
+#                 "You are a real estate filter extractor. "
+#                 "Extract parameters from the user's request and return ONLY valid JSON with these fields: "
+#                 "{type, rooms, stage, price_max, price_order}."
+#             )},
+#             {"role": "user", "content": text}
+#         ]
+#         resp = client.chat.completions.create(
+#             model="gpt-4.1-mini",
+#             messages=messages,
+#             max_tokens=200
+#         )
+#         raw = resp.choices[0].message.content.strip()
+#         print("\n\nGPT RAW:", raw, "\n\n")
+#         data = json.loads(raw)
+#         if isinstance(data, dict):
+#             logger.info(f"✅ GPT parsed filters: {data}")
+#             return data
+#         return {}
+#     except Exception as e:
+#         logger.warning(f"⚠️ Ошибка парсинга фильтров GPT: {e}")
+#         return {}
+
+
+# # === Основная функция ===
+# async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int = None):
+#     print("\n\nUSER MESSAGE:", text, "\n\n")
+#     text = text.strip()
+#     if not text:
+#         return {"text": "❗ Пустой запрос"}
+
+#     if bot and chat_id:
+#         asyncio.create_task(show_typing(bot, chat_id, duration=5))
+
+#     lang = await detect_language(text)
+#     user_conversations[user_id].append(text)
+
+#     filters = await extract_filters_with_gpt(text)
+#     if not filters:
+#         filters = fallback_parse_filters(text)
+#         if filters:
+#             logger.info(f"⚙️ GPT не вернул фильтры, fallback: {filters}")
+
+#     if not filters:
+#         msg = {
+#             "ru": "Пожалуйста, уточните хотя бы одно пожелание 💬",
+#             "uz": "Iltimos, kamida bitta talabni kiriting 💬",
+#             "en": "Please specify at least one preference 💬",
+#             "kk": "Кем дегенде бір қалауыңызды көрсетіңіз 💬",
+#         }[lang]
+#         return {"text": msg}
+
+#     last_filters_cache[user_id] = filters
+#     shown_flats_cache[user_id].clear()
+
+#     if bot and chat_id:
+#         asyncio.create_task(show_typing(bot, chat_id, duration=5))
+
+#     # === Поиск в БД ===
+#     session = Session()
+#     query = session.query(DBFlats)
+
+#     if filters.get("type"):
+#         query = query.filter(DBFlats.type == filters["type"])
+#     if filters.get("rooms"):
+#         query = query.filter(DBFlats.rooms == filters["rooms"])
+#     if filters.get("stage"):
+#         query = query.filter(DBFlats.stage == filters["stage"])
+#     if filters.get("price_max"):
+#         query = query.filter(DBFlats.price <= filters["price_max"])
+#     if filters.get("price_order") == "min":
+#         query = query.order_by(DBFlats.price.asc())
+#     elif filters.get("price_order") == "max":
+#         query = query.order_by(DBFlats.price.desc())
+
+#     flats = query.filter(DBFlats.status == "Свободно").all()
+#     session.close()
+
+#     if not flats:
+#         msg = {
+#             "ru": "К сожалению, объекты с такими параметрами не найдены. 🏙",
+#             "uz": "Afsuski, bunday parametrli obyektlar topilmadi. 🏙",
+#             "en": "Unfortunately, no properties match these parameters. 🏙",
+#             "kk": "Өкінішке орай, мұндай параметрлермен нысандар табылмады. 🏙",
+#         }[lang]
+#         return {"text": msg}
+
+#     seen = shown_flats_cache[user_id]
+#     new_flats = [f for f in flats if f.number not in seen][:4]
+#     if not new_flats:
+#         seen.clear()
+#         new_flats = flats[:4]
+#     for f in new_flats:
+#         seen.add(f.number)
+
+#     results = []
+#     for f in new_flats:
+#         text_base = (
+#             f"🏠 {f.type} №{f.number}\n"
+#             f"• Комнат: {f.rooms}\n"
+#             f"• Этаж: {f.stage}\n"
+#             f"• Площадь: {f.sq_m} м²\n"
+#             f"• Цена: {f.price} $\n"
+#             f"• Подъезд: {f.lobby}\n"
+#             f"{f.description}\n\n"
+#             "С вами свяжется менеджер для уточнения деталей. 🏙"
+#         )
+
+#         if lang != "ru":
+#             try:
+#                 messages = [
+#                     {"role": "system", "content": f"Translate the text to {lang}, keep numbers and names unchanged."},
+#                     {"role": "user", "content": text_base}
+#                 ]
+#                 translation = client.chat.completions.create(
+#                     model="gpt-4.1-mini",
+#                     messages=messages
+#                 )
+#                 text_base = translation.choices[0].message.content.strip()
+#             except Exception:
+#                 pass
+
+#         photo_val = normalize_url(f.plan.strip()) if getattr(f, "plan", None) else None
+#         results.append({"text": text_base, "photo": photo_val})
+
+#     return {"flats": results}
+
+
+# # === Очистка истории ===
+# def clear_user(user_id: int):
+#     user_conversations[user_id].clear()
+#     last_filters_cache.pop(user_id, None)
+#     shown_flats_cache.pop(user_id, None)
+
+
 import os
 import json
 import logging
 import re
-from collections import defaultdict
-from dotenv import load_dotenv
-from db import Session, Flats as DBFlats
-from urllib.parse import urlsplit, urlunsplit, quote
-from aiogram import Bot
 import asyncio
-import openai
+from collections import defaultdict
+from urllib.parse import urlsplit, urlunsplit, quote
+from dotenv import load_dotenv
+from aiogram import Bot
+from openai import OpenAI
+from db import Session, Flats as DBFlats
 
 # === Инициализация ===
 load_dotenv()
-openai.api_key = os.getenv("API_KEY")
+client = OpenAI(api_key=os.getenv("API_KEY"))
 logger = logging.getLogger(__name__)
 
 # === Кэши ===
@@ -877,41 +1332,38 @@ shown_flats_cache = defaultdict(set)
 SUPPORTED_LANGS = {"ru", "uz", "en", "kk"}
 
 
-# === РЕЗЕРВНЫЙ ПАРСЕР (если GPT не справился) ===
+# === РЕЗЕРВНЫЙ ПАРСЕР (fallback) ===
 def fallback_parse_filters(text: str) -> dict:
-    """
-    Простейший резервный парсер для запросов вида:
-    '1 комнатная квартира на 8 этаже до 50000$'
-    """
     filters = {}
 
-    # Кол-во комнат
-    rooms_match = re.search(r'(\d+)\s*комнат', text, re.IGNORECASE)
-    if rooms_match:
-        filters['rooms'] = int(rooms_match.group(1))
+    # 1–5 комнат
+    if match := re.search(r'(\d+)\s*[- ]?\s*комнат', text, re.IGNORECASE):
+        filters["rooms"] = int(match.group(1))
 
-    # Этаж
-    floor_match = re.search(r'(\d+)\s*(?:этаж|этаже)', text, re.IGNORECASE)
-    if floor_match:
-        filters['stage'] = int(floor_match.group(1))
+    # этаж
+    if match := re.search(r'(\d+)\s*(?:этаж|этаже)', text, re.IGNORECASE):
+        filters["stage"] = int(match.group(1))
 
-    # Цена
-    price_match = re.search(r'(\d+[.,]?\d*)\s*(?:\$|доллар|тыс)', text, re.IGNORECASE)
-    if price_match:
-        filters['price_max'] = float(price_match.group(1).replace(',', '.'))
+    # цена до / максимум
+    if match := re.search(r'(\d+[.,]?\d*)\s*(?:\$|доллар|тыс|тысяч)', text, re.IGNORECASE):
+        price = float(match.group(1).replace(',', '.'))
+        if 'тыс' in text.lower():
+            price *= 1000
+        filters["price_max"] = int(price)
 
-    # Тип недвижимости
-    if 'магазин' in text.lower():
-        filters['type'] = 'Магазин'
-    elif 'студ' in text.lower():
-        filters['type'] = 'Студия'
+    # тип
+    low = text.lower()
+    if 'магазин' in low:
+        filters["type"] = "Магазин"
+    elif 'студ' in low or '1 комнат' in low:
+        filters["type"] = "Студия"
     else:
-        filters['type'] = 'Квартира'
+        filters["type"] = "Квартира"
 
     return filters
 
 
-# === Утилита для URL ===
+# === УТИЛИТА ДЛЯ URL ===
 def normalize_url(url: str) -> str:
     try:
         parts = urlsplit(url)
@@ -922,7 +1374,7 @@ def normalize_url(url: str) -> str:
         return url
 
 
-# === Вспомогательная функция: статус “печатает...” ===
+# === "ПЕЧАТАЕТ..." ===
 async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
     try:
         end_time = asyncio.get_event_loop().time() + duration
@@ -933,17 +1385,17 @@ async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
         pass
 
 
-# === Определение языка ===
-def detect_language(text: str) -> str:
+# === ОПРЕДЕЛЕНИЕ ЯЗЫКА ===
+async def detect_language(text: str) -> str:
     try:
-        prompt = f"""
-Detect the language of this text and respond ONLY with:
-ru, en, uz, or kk.
-Text: "{text}"
-"""
-        resp = openai.chat.completions.create(
-            model="gpt-5-nano",
-            messages=[{"role": "user", "content": prompt}],
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "Respond ONLY with one code: ru, en, uz, kk."},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=5,
         )
         lang = resp.choices[0].message.content.strip().lower()
         return lang if lang in SUPPORTED_LANGS else "ru"
@@ -951,70 +1403,73 @@ Text: "{text}"
         return "ru"
 
 
-# === Извлечение фильтров через GPT ===
-def extract_filters_with_gpt(text: str) -> dict:
+# === GPT-ПАРСЕР ФИЛЬТРОВ ===
+async def extract_filters_with_gpt(text: str) -> dict:
+    """
+    GPT парсит фильтры из пользовательского запроса.
+    Гарантирует возврат корректного JSON.
+    """
     try:
-        prompt = f"""
-You are a real estate filter extractor.
-Extract parameters from the user's request and return ONLY valid JSON.
-Fields:
-- type: "Квартира" | "Студия" | "Магазин"
-- rooms: integer
-- stage: integer
-- price_max: integer
-- price_order: "min" | "max"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты парсер фильтров недвижимости. "
+                    "Верни только JSON без текста и комментариев. "
+                    "Если данных нет — верни '{}'. "
+                    "Поля: type (Квартира|Студия|Магазин), rooms (int), stage (int), "
+                    "price_max (int), price_order (min|max)."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
 
-User request: "{text}"
-
-Respond ONLY with JSON, no explanation.
-Example:
-{{"type": "Квартира", "rooms": 2, "price_max": 50000}}
-"""
-        resp = openai.chat.completions.create(
-            model="gpt-5-nano",
-            messages=[{"role": "user", "content": prompt}],
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            temperature=0.1,
+            max_tokens=200,
         )
+
         raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            logger.info(f"✅ GPT parsed filters: {data}")
-            return data
-        return {}
+        print("\n[GPT RAW FILTERS]:", raw, "\n")
+
+        # убираем markdown-мусор ```json ```
+        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("GPT ответил не JSON")
+
+        logger.info(f"✅ GPT parsed filters: {data}")
+        return data
+
     except Exception as e:
         logger.warning(f"⚠️ Ошибка парсинга фильтров GPT: {e}")
-        return {}
+        filters = fallback_parse_filters(text)
+        logger.info(f"🔄 Используем fallback: {filters}")
+        return filters
 
 
-# === Основная функция ===
+# === ГЛАВНАЯ ФУНКЦИЯ ===
 async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int = None):
-    """
-    Основная функция подбора квартир.
-    GPT-5-nano — основной парсер фильтров.
-    Fallback-парсер используется, если GPT не справился.
-    """
-    print('\n\nUSER MESSAGE:', text, '\n\n')
+    print(f"\n=== USER MESSAGE ===\n{text}\n====================\n")
     text = text.strip()
     if not text:
         return {"text": "❗ Пустой запрос"}
 
-    # 🔸 Показываем статус "печатает..."
     if bot and chat_id:
         asyncio.create_task(show_typing(bot, chat_id, duration=5))
 
-    # --- Определяем язык ---
-    lang = detect_language(text)
-    user_conversations[user_id].append({"role": "user", "content": text})
+    # язык
+    lang = await detect_language(text)
+    user_conversations[user_id].append(text)
 
-    # --- Пытаемся получить фильтры от GPT ---
-    filters = extract_filters_with_gpt(text)
-
-    # --- Если GPT не справился, пробуем fallback ---
+    # фильтры
+    filters = await extract_filters_with_gpt(text)
     if not filters:
         filters = fallback_parse_filters(text)
-        if filters:
-            logger.info(f"⚙️ GPT не вернул фильтры, fallback сработал: {filters}")
 
-    # --- Если всё ещё пусто ---
     if not filters:
         msg = {
             "ru": "Пожалуйста, уточните хотя бы одно пожелание 💬",
@@ -1024,15 +1479,13 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
         }[lang]
         return {"text": msg}
 
-    # --- Сохраняем фильтры ---
     last_filters_cache[user_id] = filters
     shown_flats_cache[user_id].clear()
 
-    # 🔸 Показываем статус "печатает..." при поиске
     if bot and chat_id:
         asyncio.create_task(show_typing(bot, chat_id, duration=5))
 
-    # --- Поиск в БД ---
+    # === Поиск в БД ===
     session = Session()
     query = session.query(DBFlats)
 
@@ -1052,7 +1505,6 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     flats = query.filter(DBFlats.status == "Свободно").all()
     session.close()
 
-    # --- Если ничего не найдено ---
     if not flats:
         msg = {
             "ru": "К сожалению, объекты с такими параметрами не найдены. 🏙",
@@ -1062,7 +1514,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
         }[lang]
         return {"text": msg}
 
-    # --- Выбор новых квартир ---
+    # === Фильтруем уже показанные ===
     seen = shown_flats_cache[user_id]
     new_flats = [f for f in flats if f.number not in seen][:4]
     if not new_flats:
@@ -1071,7 +1523,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     for f in new_flats:
         seen.add(f.number)
 
-    # --- Формируем ответы ---
+    # === Формируем вывод ===
     results = []
     for f in new_flats:
         text_base = (
@@ -1085,22 +1537,23 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
             "С вами свяжется менеджер для уточнения деталей. 🏙"
         )
 
-        # Перевод описания, если язык не русский
+        # перевод, если язык не русский
         if lang != "ru":
             try:
-                translation = openai.chat.completions.create(
-                    model="gpt-5-nano",
+                translation = client.chat.completions.create(
+                    model="gpt-4.1-mini",
                     messages=[
                         {
                             "role": "system",
-                            "content": f"Переведи текст на {lang}, не изменяя числа и названия ЖК.",
+                            "content": f"Translate to {lang}, but keep numbers and building names unchanged.",
                         },
                         {"role": "user", "content": text_base},
                     ],
+                    temperature=0,
                 )
                 text_base = translation.choices[0].message.content.strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Ошибка перевода: {e}")
 
         photo_val = normalize_url(f.plan.strip()) if getattr(f, "plan", None) else None
         results.append({"text": text_base, "photo": photo_val})
@@ -1113,28 +1566,3 @@ def clear_user(user_id: int):
     user_conversations[user_id].clear()
     last_filters_cache.pop(user_id, None)
     shown_flats_cache.pop(user_id, None)
-
-
-def get_formatted_dialog(user_message):
-    system_prompt = (
-        "Ты — умный фильтрующий помощник. "
-        "Твоя задача: определить язык пользователя, перевести сообщение на русский, "
-        "и выделить фильтры для поиска квартир или магазинов.\n\n"
-        "Если человек ищет квартиру, используй поля:\n"
-        "type: квартира / магазин / студия\n"
-        "rooms: количество комнат (если указано)\n"
-        "price_min / price_max: диапазон цены (если есть)\n"
-        "area_min / area_max: диапазон площади (если есть)\n\n"
-        "Ответ всегда в JSON!\n"
-        "Пример:\n"
-        "{\n"
-        '  "lang": "uz",\n'
-        '  "filters": {"type": "квартира", "rooms": 2},\n'
-        '  "translation": "Мне нужна квартира с 2 комнатами"\n'
-        "}"
-    )
-
-    return (
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    )
