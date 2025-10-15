@@ -1915,3 +1915,4 @@ def clear_user(user_id: int):
     last_filters_cache.pop(user_id, None)
     shown_flats_cache.pop(user_id, None)
 
+# гитлер
