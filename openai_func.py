@@ -119,13 +119,12 @@ async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
 async def detect_language(text: str) -> str:
     try:
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-5-chat-latest",
             messages=[
                 {"role": "system", "content": "Respond ONLY with one code: ru, en, uz, kk."},
                 {"role": "user", "content": text},
             ],
-            temperature=0,
-            max_tokens=5,
+            max_completion_tokens=5,
         )
         lang = resp.choices[0].message.content.strip().lower()
         return lang if lang in SUPPORTED_LANGS else "ru"
@@ -159,10 +158,9 @@ async def extract_filters_with_gpt(text: str) -> dict:
         ]
 
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-5-chat-latest",
             messages=messages,
-            temperature=0.1,
-            max_tokens=250,
+            max_completion_tokens=250,
         )
 
         raw = resp.choices[0].message.content.strip()
@@ -309,7 +307,7 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
         if lang != "ru":
             try:
                 translation = client.chat.completions.create(
-                    model="gpt-4.1-mini",
+                    model="gpt-5-chat-latest",
                     messages=[
                         {
                             "role": "system",
@@ -317,7 +315,6 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
                         },
                         {"role": "user", "content": text_base},
                     ],
-                    temperature=0,
                 )
                 text_base = translation.choices[0].message.content.strip()
             except Exception as e:
@@ -334,4 +331,3 @@ def clear_user(user_id: int):
     user_conversations[user_id].clear()
     last_filters_cache.pop(user_id, None)
     shown_flats_cache.pop(user_id, None)
-

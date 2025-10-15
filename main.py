@@ -201,17 +201,31 @@ def build_manager_message(user_id: int) -> str:
         if conv:
             dialog_lines = []
             for msg in conv:
-                role = msg.get("role", "user")
-                content = msg.get("content", "").strip()
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "").strip()
+                else:
+                    # если просто строка, считаем сообщение клиента
+                    role = "user"
+                    content = str(msg).strip()
+
                 if not content:
                     continue
+
                 if role == "user":
                     dialog_lines.append(f"👤 Клиент: {content}")
                 elif role == "assistant":
                     dialog_lines.append(f"🤖 Бот: {content}")
                 else:
                     dialog_lines.append(f"{role}: {content}")
-            dialog = "\n\n".join(dialog_lines)
+
+            # убираем дубликаты подряд идущих сообщений (если вдруг есть)
+            dedup_dialog = []
+            for line in dialog_lines:
+                if not dedup_dialog or line != dedup_dialog[-1]:
+                    dedup_dialog.append(line)
+
+            dialog = "\n\n".join(dedup_dialog)
         else:
             dialog = "—"
     except Exception:
@@ -221,12 +235,13 @@ def build_manager_message(user_id: int) -> str:
         f"👤 Имя: {name}\n"
         f"📞 Телефон: {phone}\n"
         f"{flat_line}\n\n"
-        f"💬 Диалог с GPT:\n"
+        f"💬 Диалог:\n"
         f"<pre>{dialog}</pre>"
     )
 
     text = text.replace("Shum", "")
     return text
+
 
 
 # ====== Менеджерское сообщение ======
