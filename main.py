@@ -17,7 +17,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-from openai import OpenAI
 from collections import defaultdict
 
 from db import Session, Flats as DBFlats , Credit, Flats 
@@ -786,6 +785,16 @@ async def handle_phone(message: Message, state: FSMContext):
     "Bu sizga eng mos variantlarni topishga yordam beradi 🏙\n\n"
 
     "Qidiruvni qayerdan boshlaymiz?\n\n"
+
+    "🇬🇧 Welcome to Royal Residence.\n"
+    "I’m your AI Sales Manager, here to help you find the perfect apartment.\n"
+    "I’ll select the best options, show you floor plans, and assist with mortgage calculations.\n\n"
+
+    "Please tell me your preferences — number of rooms, floor, area, or budget.\n\n"
+
+    "This will help me find the most suitable options for you 🏙\n\n"
+
+    "Where would you like to start your search?\n\n"
 )
 
     await state.clear()
