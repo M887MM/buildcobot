@@ -814,9 +814,16 @@ async def handle_phone(message: Message, state: FSMContext):
 
     await state.clear()
 
+
 @dp.message()
 async def handle_question(message: Message, state: FSMContext):
     user_id = message.from_user.id
+
+    # 🧩 Если пользователь отправил контакт — сразу обрабатываем его
+    if message.contact:
+        await handle_phone(message, state)
+        return
+
     sel = user_selection.setdefault(user_id, {})
 
     # 🚫 Проверяем — если нет телефона
@@ -836,7 +843,7 @@ async def handle_question(message: Message, state: FSMContext):
     if not question:
         await message.answer("⚠️ Пустой вопрос. Напишите текст.")
         return
-
+    
     try:
         # 🔹 GPT-ответ с фото
         logging.info("Пользователь запросил у GPT: %s", question)
