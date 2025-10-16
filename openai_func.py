@@ -149,7 +149,7 @@ async def extract_filters_with_gpt(text: str) -> dict:
                     "Ты парсер фильтров недвижимости. "
                     "Верни только JSON без текста и комментариев. "
                     "Если данных нет — верни '{}'. "
-                    "Поля: number (int), type (Квартира|Студия|Магазин), rooms (int), "
+                    "Поля: number (int) если клиент сказал, type (Квартира|Студия|Магазин), rooms (int), "
                     "stage (int), stage_min (int), stage_max (int), price_max (int), price_order (min|max). "
                     "Также понимай узбекские слова 'qavat', 'xonali', 'honali' как этажи и комнаты."
                 ),
