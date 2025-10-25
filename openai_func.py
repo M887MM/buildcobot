@@ -4,10 +4,18 @@ import logging
 import re
 import asyncio
 from collections import defaultdict
+from typing import List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, quote
+
 from dotenv import load_dotenv
 from aiogram import Bot, types
 from openai import OpenAI
+
+try:
+    from anthropic import Anthropic
+except ImportError:  # библиотека может быть не установлена
+    Anthropic = None
+
 from db import Session, Flats as DBFlats
 
 # === Инициализация ===
@@ -15,11 +23,126 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("API_KEY"))
 logger = logging.getLogger(__name__)
 
+DEFAULT_GPT_MODEL = "gpt-5-chat-latest"
+CLAUDE_MODEL = "claude-3-5-haiku-latest"
+
+_claude_client = None
+_claude_key = os.getenv("ANTHROPIC_API_KEY")
+if _claude_key and Anthropic:
+    try:
+        _claude_client = Anthropic(api_key=_claude_key)
+    except Exception as claude_init_error:
+        logger.warning("Не удалось инициализировать клиент Claude: %s", claude_init_error)
+elif _claude_key and not Anthropic:
+    logger.warning("Библиотека anthropic не установлена, fallback Claude недоступен")
+
 # === Кэши ===
 user_conversations = defaultdict(list)
 last_filters_cache = {}
 shown_flats_cache = defaultdict(set)
 SUPPORTED_LANGS = {"ru", "uz", "en", "kk"}
+
+
+def _normalize_message_text(content) -> str:
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _is_empty_response(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    normalized = text.strip()
+    return normalized in {"[]", "[ ]"}
+
+
+def _call_openai(messages: List[dict], max_tokens: Optional[int], model: str) -> str:
+    params = {
+        "model": model,
+        "messages": messages,
+    }
+    if max_tokens is not None:
+        params["max_completion_tokens"] = max_tokens
+
+    response = client.chat.completions.create(**params)
+    choice = response.choices[0]
+    content = _normalize_message_text(choice.message.content)
+    return content.strip()
+
+
+def _call_claude(messages: List[dict], max_tokens: Optional[int]) -> str:
+    if not _claude_client:
+        raise RuntimeError("Claude client is not configured")
+
+    system_parts: List[str] = []
+    claude_messages = []
+
+    for message in messages:
+        role = message.get("role")
+        text = _normalize_message_text(message.get("content"))
+        if not text:
+            continue
+        if role == "system":
+            system_parts.append(text)
+        elif role in {"user", "assistant"}:
+            claude_messages.append({
+                "role": role,
+                "content": text,
+            })
+
+    system_prompt = "\n".join(system_parts) if system_parts else None
+    output_tokens = max_tokens if max_tokens and max_tokens > 0 else 512
+
+    response = _claude_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_output_tokens=output_tokens,
+        system=system_prompt,
+        messages=claude_messages,
+    )
+
+    if not response.content:
+        return ""
+
+    parts = []
+    for item in response.content:
+        if isinstance(item, dict):
+            text = item.get("text")
+        else:
+            text = getattr(item, "text", None)
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def call_chat_with_fallback(
+    messages: List[dict],
+    *,
+    max_tokens: Optional[int] = None,
+    model: str = DEFAULT_GPT_MODEL,
+) -> Tuple[str, str]:
+    try:
+        gpt_content = _call_openai(messages, max_tokens, model)
+        if _is_empty_response(gpt_content):
+            raise ValueError("GPT вернул пустой ответ")
+        return gpt_content, "gpt"
+    except Exception as gpt_error:
+        logger.warning("GPT недоступен или вернул пустой ответ: %s", gpt_error)
+
+        try:
+            claude_content = _call_claude(messages, max_tokens)
+            if _is_empty_response(claude_content):
+                raise ValueError("Claude вернул пустой ответ")
+            logger.info("Использован fallback Claude Haiku 3.5")
+            return claude_content, "claude"
+        except Exception as claude_error:
+            logger.error("Не удалось получить ответ от Claude: %s", claude_error)
+            raise RuntimeError("Claude fallback failed") from claude_error
 
 
 # === РЕЗЕРВНЫЙ ПАРСЕР (fallback) ===
@@ -118,18 +241,20 @@ async def show_typing(bot: Bot, chat_id: int, duration: int = 5):
 # === ОПРЕДЕЛЕНИЕ ЯЗЫКА ===
 async def detect_language(text: str) -> str:
     try:
-        resp = client.chat.completions.create(
-            model="gpt-5-chat-latest",
-            messages=[
+        content, provider = call_chat_with_fallback(
+            [
                 {"role": "system", "content": "Respond ONLY with one code: ru, en, uz, kk."},
                 {"role": "user", "content": text},
             ],
-            max_completion_tokens=5,
+            max_tokens=5,
         )
-        lang = resp.choices[0].message.content.strip().lower()
-        return lang if lang in SUPPORTED_LANGS else "ru"
-    except Exception:
-        return "ru"
+        lang = content.strip().lower()
+        if lang in SUPPORTED_LANGS:
+            return lang
+        logger.debug("Неизвестный язык '%s' от %s, используем ru по умолчанию", lang, provider)
+    except Exception as error:
+        logger.warning("Ошибка определения языка: %s", error)
+    return "ru"
 
 
 # === GPT-ПАРСЕР ФИЛЬТРОВ ===
@@ -157,14 +282,8 @@ async def extract_filters_with_gpt(text: str) -> dict:
             {"role": "user", "content": text},
         ]
 
-        resp = client.chat.completions.create(
-            model="gpt-5-chat-latest",
-            messages=messages,
-            max_completion_tokens=250,
-        )
-
-        raw = resp.choices[0].message.content.strip()
-        print("\n[GPT RAW FILTERS]:", raw, "\n")
+        raw, provider = call_chat_with_fallback(messages, max_tokens=250)
+        print(f"\n[{provider.upper()} RAW FILTERS]:", raw, "\n")
 
         # убираем markdown-мусор ```json ``` и т.п.
         cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
@@ -185,11 +304,11 @@ async def extract_filters_with_gpt(text: str) -> dict:
         if "stage_min" in data and "stage_max" in data and "stage" in data:
             data.pop("stage", None)
 
-        logger.info(f"✅ GPT parsed filters: {data}")
+        logger.info("✅ %s parsed filters: %s", provider.upper(), data)
         return data
 
     except Exception as e:
-        logger.warning(f"⚠️ Ошибка парсинга фильтров GPT: {e}")
+        logger.warning("⚠️ Ошибка парсинга фильтров AI: %s", e)
         filters = fallback_parse_filters(text)
         logger.info(f"🔄 Используем fallback: {filters}")
         return filters
@@ -306,9 +425,8 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
         # перевод, если язык не русский
         if lang != "ru":
             try:
-                translation = client.chat.completions.create(
-                    model="gpt-5-chat-latest",
-                    messages=[
+                translated, provider = call_chat_with_fallback(
+                    [
                         {
                             "role": "system",
                             "content": f"Translate to {lang}, but keep numbers and building names unchanged.",
@@ -316,7 +434,8 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
                         {"role": "user", "content": text_base},
                     ],
                 )
-                text_base = translation.choices[0].message.content.strip()
+                text_base = translated.strip()
+                logger.info("Перевод выполнен с использованием %s", provider.upper())
             except Exception as e:
                 logger.warning(f"Ошибка перевода: {e}")
 
