@@ -1,26 +1,29 @@
 import asyncio
-import os
-import re
-import logging
-from collections import Counter
 import csv
-from aiogram.enums import ParseMode
-from datetime import datetime
-from aiogram.filters import Command
-from aiogram import Bot, Dispatcher, types, exceptions
-from aiogram.filters import CommandStart, StateFilter
-from contextlib import contextmanager
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, InputMediaPhoto
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
+import html
+import logging
+import os
+import inspect
 from collections import defaultdict
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Optional
 
-from db import Session, Flats as DBFlats , Credit, Flats 
+from aiogram import Bot, Dispatcher, exceptions, types
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramMigrateToChat
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, InputMediaPhoto, Message)
+from dotenv import load_dotenv
+
+from db import Product as DBProduct, Session
+from text_utils import normalize_text
 import openai_func
+from sqlalchemy.orm import selectinload
 
 # ====== Настройки ======
 load_dotenv()
@@ -35,165 +38,147 @@ if not BOT_TOKEN:
     logging.error("BOT_TOKEN не задан в окружении. Прерван запуск.")
     raise SystemExit("BOT_TOKEN is required")
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ====== Загрузка квартир из БД ======
-import logging
-from contextlib import contextmanager
-from db import Session, Flats as DBFlats
+# Глобальная витрина товаров
+Products: dict[int, dict] = {}
 
-# Глобальная переменная для хранения квартир
-Flats = {}
+WELCOME_PHOTO_URL = (
+    "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9"
+    "?auto=format&fit=crop&w=800&q=80"
+)
+WELCOME_MESSAGE = (
+    "💄 Добро пожаловать в LuxeBeauty!\n\n"
+    "Чем помочь сегодня? Подберите уход, макияж, подарки или узнайте о доставке."
+)
 
-credit_works = False
+GOODS_OVERVIEW_TEXT = (
+    "🛍️ Направления бутика LuxeBeauty:\n"
+    "1. ✨ Уход за кожей лица и тела\n"
+    "2. 💋 Макияж и аксессуары\n"
+    "3. 🌸 Парфюмерия для неё и для него\n"
+    "4. 💆‍♀️ Уход за волосами и стайлинг\n"
+    "5. 🎁 Подарочные наборы и бьюти-боксы\n"
+    "6. 🧴 Spa- и home-care коллекции\n\n"
+    "Напишите, что ищете — предложу подбор или откройте каталог по кнопке ниже."
+)
+
 
 @contextmanager
 def get_session():
-    """
-    Контекстный менеджер для безопасной работы с сессией SQLAlchemy.
-    Гарантирует закрытие сессии после использования.
-    """
+    """Контекстный менеджер для безопасной работы с сессией SQLAlchemy."""
     session = Session()
     try:
         yield session
     finally:
         session.close()
 
-async def load_flats():
-    """
-    Загружает квартиры из базы данных и сохраняет в глобальный словарь Flats.
-    Если база пуста или произошла ошибка, используется заглушка.
-    """
-    global Flats
+
+async def load_products():
+    """Загружает товары из базы данных и наполняет глобальный каталог."""
+    global Products
+    Products = {}
+    placeholder_photo = "https://via.placeholder.com/600x400.png?text=No+Image"
     try:
         with get_session() as session:
-            db_flats = session.query(DBFlats).filter(DBFlats.status == "Свободно").all()
-    except Exception as e:
-        logging.exception("Ошибка загрузки квартир из БД: %s", e)
-        db_flats = []
+            db_items = (
+                session.query(DBProduct)
+                .options(selectinload(DBProduct.category_obj))
+                .order_by(DBProduct.name.asc())
+                .all()
+            )
+            for idx, item in enumerate(db_items, start=1):
+                Products[idx] = build_product_entry(item, idx, placeholder_photo)
+    except Exception as exc:
+        logging.exception("Ошибка загрузки товаров из БД: %s", exc)
+        return
+    logging.info("Загружено товаров: %d", len(Products))
 
-    # Заглушка, если база пуста
-    if not db_flats:
-        class _Stub:
-            number = "N/A"
-            rooms = 1
-            sq_m = 30
-            price = 10000
-            stage = 1
-            plan = "https://via.placeholder.com/600x400.png?text=No+Flats+in+DB"
-        db_flats = [_Stub()]
 
-    Flats = {
-        i + 1: {
-            "type": flat.type,
-            "rooms": flat.rooms,
-            "area": getattr(flat, "sq_m", None),
-            "price": getattr(flat, "price", 0),
-            "stage": getattr(flat, "stage", None),
-            "photo": getattr(flat, "plan", None) or "https://via.placeholder.com/600x400.png?text=No+Image",
-            "raw": flat,
-            "cached_file_id": None
-        }
-        for i, flat in enumerate(sorted(db_flats, key=lambda f: f.number))
+def build_product_entry(item, idx: int, placeholder_photo: str) -> dict:
+    pictures = list(getattr(item, "picture", []) or [])
+    normalized_pictures = [
+        normalize_text(photo) or placeholder_photo for photo in pictures if photo
+    ]
+    photo = normalized_pictures[0] if normalized_pictures else placeholder_photo
+    return {
+        "id": getattr(item, "id", idx),
+        "name": normalize_text(getattr(item, "name", None)) or f"Товар #{idx}",
+        "category": normalize_text(getattr(item, "category", None)) or "Категория не указана",
+        "price": float(getattr(item, "price", 0) or 0),
+        "old_price": getattr(item, "old_price", None),
+        "description": normalize_text(getattr(item, "description", None)) or "",
+        "tags": normalize_text(getattr(item, "tags", None)) or "",
+        "pictures": normalized_pictures or [placeholder_photo],
+        "photo": photo,
+        "cached_file_id": None,
     }
-    logging.info("Загружено квартир: %d", len(Flats))
+
+
+async def send_welcome(chat_id: int):
+    try:
+        await bot.send_photo(
+            chat_id,
+            WELCOME_PHOTO_URL,
+            caption=WELCOME_MESSAGE,
+            reply_markup=start_keyboard(),
+        )
+    except Exception:
+        await bot.send_message(chat_id, WELCOME_MESSAGE, reply_markup=start_keyboard())
 
 
 # ====== FSM ======
-class CreditState(StatesGroup):
-    waiting_downpayment = State()
-    waiting_term = State()
-    asking_question = State()
+class OrderState(StatesGroup):
+    waiting_quantity = State()
+    waiting_comment = State()
     sending_phone = State()
 
 # ====== Хранилища в памяти ======
-user_selection = {}         # per user: flat, phone, username, name, display_chat_id, display_msg_id, ...
+user_selection = {}         # per user: product, phone, username, name, quantity, comment, ...
 manager_message_ids = {}
 
 # ====== Кнопки и клавиатуры ======
-def main_keyboard(index: int, has_contact: bool) -> InlineKeyboardMarkup:
-    nav_row = [
-        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"flat_{index-1}"),
-        InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"flat_{index+1}")
-    ]
-    choose_row = [
-        InlineKeyboardButton(text="🔍 Подробнее", callback_data=f"choose_{index}")
-    ]
-    extra_row = [
-        InlineKeyboardButton(text="📋 Список квартир", callback_data="show_list")
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[nav_row, choose_row, extra_row])
-
-def choose_keyboard(index: int, has_contact: bool = False) -> InlineKeyboardMarkup:
-    row = [
-        InlineKeyboardButton(text="💳 Рассчитать в кредит", callback_data=f"calc_{index}"),
-    ]
-    back = [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="back_to_list")]
-
-    keyboard = [row, back]
-
-    if not has_contact:
-        contact_row = [
-            InlineKeyboardButton(text="📲 Отправить контакт", callback_data="request_phone")
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🛍️ Товары", callback_data="start_products"),
+                InlineKeyboardButton(text="🔥 Акции", callback_data="start_promos"),
+            ],
+            [
+                InlineKeyboardButton(text="📂 Каталог", url="https://evrostroynks.uz"),
+                InlineKeyboardButton(text="📍 Локация", callback_data="show_location"),
+            ],
         ]
-        keyboard.insert(1, contact_row)
+    )
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def result_keyboard(flat_index: int = 1) -> InlineKeyboardMarkup:
-    row = [
-        InlineKeyboardButton(text="🔄 Новый расчёт", callback_data="new_calc"),
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[row])
-
-def back_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_flats")]])
+def goods_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📂 Каталог", url="https://luxebeauty.uz"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu"),
+            ],
+        ]
+    )
 
 # ====== Утилиты ======
-def flat_caption(index: int) -> str:
-    f = Flats.get(index)
-    if not f:
-        return "🏠 Квартира недоступна"
-    flat_type = f.get("type")
-    price = f.get("price") or 0
-    price_str = f"{price:,}".replace(",", " ")
-    raw = f.get("raw")
-    number = getattr(raw, "number", "?") if raw else "?"
-    return (f"🏠 {flat_type} {index} (№{number})\n"
-            f"• Комнат: {f.get('rooms', '—')}\n"
-            f"• Площадь: {f.get('area', '—')} м²\n"
-            f"• Этаж: {f.get('stage', '—')}\n"
-            f"• Цена: {price_str} $")
-
-
-def calc_credit(price: int, percent: int, months: int):
-    rate = 0.25 / 12
-    initial = price * percent / 100
-    loan = price - initial
-    payment = 0 if months == 0 else loan * (rate * (1 + rate) ** months) / ((1 + rate) ** months - 1)
-    total = payment * months
-    overpay = total - loan
-    return int(initial), int(loan), int(round(payment)), int(round(total)), int(round(overpay))
-
 def build_manager_message(user_id: int) -> str:
     sel = user_selection.get(user_id, {})
     name = sel.get("name") or "Неизвестно"
     phone = sel.get("phone") or "Не указан"
-    flat_idx = sel.get("flat")
-
-    # Инфо о квартире
-    if flat_idx and Flats.get(flat_idx):
-        raw = Flats[flat_idx]["raw"]
-        number = getattr(raw, "number", "?")
-        rooms = getattr(raw, "rooms", "?")
-        sq_m = getattr(raw, "sq_m", "?")
-        price = getattr(raw, "price", "?")
-        flat_line = f"🏠 Квартира №{number}\nКомнат: {rooms}, Площадь: {sq_m} м², Цена: {price}$"
-    else:
-        flat_line = "🏠 Квартира: не выбрана"
+    product_idx = sel.get("product")
+    quantity = sel.get("quantity")
+    comment = sel.get("comment") or "—"
 
     # Диалог из openai_func.user_conversations
     try:
@@ -231,10 +216,16 @@ def build_manager_message(user_id: int) -> str:
     except Exception:
         dialog = "—"
 
+    if len(dialog) > 3500:
+        dialog = dialog[:3500].rstrip()
+        dialog += "\n… (диалог сокращён)"
+
+    dialog = html.escape(dialog)
+
     text = (
         f"👤 Имя: {name}\n"
         f"📞 Телефон: {phone}\n"
-        f"{flat_line}\n\n"
+        f"📝 Комментарий: {comment}\n\n"
         f"💬 Диалог:\n"
         f"<pre>{dialog}</pre>"
     )
@@ -242,6 +233,61 @@ def build_manager_message(user_id: int) -> str:
     text = text.replace("Shum", "")
     return text
 
+
+def _extract_migrated_chat_id(error: TelegramMigrateToChat) -> Optional[int]:
+    for attr_name in ("chat_id", "new_chat_id", "migrate_to_chat_id"):
+        value = getattr(error, attr_name, None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    params = getattr(error, "parameters", None)
+    if params:
+        value = getattr(params, "migrate_to_chat_id", None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _apply_group_migration(new_chat_id: int):
+    global GROUP_ID
+    if GROUP_ID == new_chat_id:
+        return
+    logging.warning(
+        "Группа менеджеров мигрировала в supergroup %s (старое значение %s). "
+        "Обновите переменную окружения GROUP_ID.",
+        new_chat_id,
+        GROUP_ID,
+    )
+    GROUP_ID = new_chat_id
+    os.environ["GROUP_ID"] = str(new_chat_id)
+    manager_message_ids.clear()
+
+
+async def _send_html_to_group(text: str) -> Optional[Message]:
+    global GROUP_ID
+    if not GROUP_ID:
+        return None
+    try:
+        return await bot.send_message(GROUP_ID, text, parse_mode=ParseMode.HTML)
+    except TelegramMigrateToChat as migrate_exc:
+        new_chat_id = _extract_migrated_chat_id(migrate_exc)
+        if new_chat_id is None:
+            logging.exception("Не удалось обработать миграцию чата менеджеров.")
+            return None
+        _apply_group_migration(new_chat_id)
+        try:
+            return await bot.send_message(GROUP_ID, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            logging.exception("Не удалось отправить сообщение в новую группу менеджеров.")
+            return None
+    except Exception:
+        logging.exception("Не удалось отправить сообщение менеджерам.")
+        return None
 
 
 # ====== Менеджерское сообщение ======
@@ -254,13 +300,19 @@ async def send_or_update_manager_message(user_id: int):
         try:
             await bot.edit_message_text(chat_id=GROUP_ID, message_id=mid, text=text, parse_mode=ParseMode.HTML)
             return
+        except TelegramMigrateToChat as migrate_exc:
+            new_chat_id = _extract_migrated_chat_id(migrate_exc)
+            if new_chat_id is not None:
+                _apply_group_migration(new_chat_id)
+            manager_message_ids.pop(user_id, None)
         except Exception:
-            pass
-    try:
-        sent = await bot.send_message(GROUP_ID, text, parse_mode=ParseMode.HTML)
-        manager_message_ids[user_id] = sent.message_id
-    except Exception:
-        logging.exception("Не удалось отправить менеджерское сообщение.")
+            logging.exception("Не удалось обновить менеджерское сообщение, отправляю новое.")
+            manager_message_ids.pop(user_id, None)
+    message = await _send_html_to_group(text)
+    if message:
+        manager_message_ids[user_id] = message.message_id
+    else:
+        logging.error("Не удалось отправить менеджерское сообщение.")
 
 
 # ====== CSV ======
@@ -268,16 +320,28 @@ def persist_contact_to_csv(user_id: int, filename: str = "contacts.csv"):
     sel = user_selection.get(user_id, {})
     if not sel.get("phone"):
         return
+
+    product_idx = sel.get("product")
+    product_name = ""
+    category_name = ""
+    if product_idx and Products.get(product_idx):
+        data = Products[product_idx]
+        product_name = normalize_text(data.get("name")) or ""
+        category_name = normalize_text(data.get("category")) or ""
+
+    quantity = sel.get("quantity") or ""
+    comment = sel.get("comment") or ""
+
     row = {
         "timestamp": datetime.utcnow().isoformat(),
         "user_id": user_id,
         "username": sel.get("username") or "",
         "name": sel.get("name") or "",
         "phone": sel.get("phone") or "",
-        "flat": sel.get("flat") or "",
-        "downpayment": sel.get("downpayment") or "",
-        "months": sel.get("months") or "",
-        "payment": sel.get("payment") or ""
+        "product": product_name,
+        "category": category_name,
+        "quantity": quantity,
+        "comment": comment,
     }
     file_exists = os.path.exists(filename)
     try:
@@ -306,11 +370,11 @@ async def delayed_send_contact_to_managers(user_id: int, delay_seconds: int = 1 
         manager_text = build_manager_message(user_id)
         full_text = "⏰ Повторное уведомление (через отложенное время):\n" + manager_text
 
-        try:
-            await bot.send_message(GROUP_ID, full_text, parse_mode=ParseMode.HTML)
+        message = await _send_html_to_group(full_text)
+        if message:
             logging.info(f"[DELAY TASK] Отложенное сообщение успешно отправлено в группу {GROUP_ID} для user_id={user_id}")
-        except Exception:
-            logging.exception("Не удалось отправить отложенное уведомление менеджерам.")
+        else:
+            logging.error("[DELAY TASK] Не удалось отправить отложенное уведомление менеджерам.")
 
         try:
             await send_or_update_manager_message(user_id)
@@ -390,7 +454,7 @@ def prepare_photo_for_send(photo_value):
         return ('file', photo_value, None)
     return None
 
-async def safe_send_and_store(chat_obj, user_id: int, photo_value, caption=None, reply_markup=None, flat_index: int = None):
+async def safe_send_and_store(chat_obj, user_id: int, photo_value, caption=None, reply_markup=None, product_index: int = None):
     chat_id = getattr(chat_obj, "chat", None)
     if chat_id:
         chat_id = chat_obj.chat.id
@@ -425,10 +489,10 @@ async def safe_send_and_store(chat_obj, user_id: int, photo_value, caption=None,
                 pass
             sent = await bot.send_photo(chat_id, photo=prepared[1], caption=caption, reply_markup=reply_markup)
             # кэшируем file_id
-            if flat_index and getattr(sent, "photo", None):
+            if product_index and getattr(sent, "photo", None):
                 file_id = sent.photo[-1].file_id
-                Flats[flat_index]["cached_file_id"] = file_id
-                logging.info("Cached file_id for flat %s", flat_index)
+                Products[product_index]["cached_file_id"] = file_id
+                logging.info("Cached file_id for product %s", product_index)
         else:
             logging.info("Отправка fallback текста. (печатает...)")
             try:
@@ -447,7 +511,7 @@ async def safe_send_and_store(chat_obj, user_id: int, photo_value, caption=None,
         logging.exception("safe_send_and_store: ошибка при отправке")
         return None
 
-async def try_edit_display_message(user_id: int, photo_value, caption=None, reply_markup=None, flat_index: int = None):
+async def try_edit_display_message(user_id: int, photo_value, caption=None, reply_markup=None, product_index: int = None):
     sel = user_selection.get(user_id, {})
     chat_id = sel.get("display_chat_id")
     msg_id = sel.get("display_msg_id")
@@ -482,7 +546,7 @@ async def try_edit_display_message(user_id: int, photo_value, caption=None, repl
             return True
 
         if kind == "file":
-            cached = Flats.get(flat_index, {}).get("cached_file_id") if flat_index else None
+            cached = Products.get(product_index, {}).get("cached_file_id") if product_index else None
             if cached:
                 logging.info("Редактируем media используя закэшированный file_id (печатает...)")
                 media = InputMediaPhoto(media=cached, caption=caption)
@@ -505,267 +569,174 @@ async def try_edit_display_message(user_id: int, photo_value, caption=None, repl
 # ====== Хэндлеры ======
 @dp.message(Command(commands=["start"]))
 async def cmd_start(message: Message):
+    if not Products:
+        await message.answer("Каталог пока пуст. Пожалуйста, попробуйте позже.")
+        return
+
     user_id = message.from_user.id
-    index = 1
-    has_contact = bool(user_selection.get(user_id, {}).get("phone"))
+    sel = user_selection.setdefault(user_id, {})
+    sel["at_menu"] = True
+    index = sel.get("product", 1)
+    if index not in Products:
+        index = 1
+    sel["display_chat_id"] = message.chat.id
+    sel["product"] = index
+    sel.pop("display_msg_id", None)
 
-    # Сохраняем chat_id сразу
-    user_sel = user_selection.setdefault(user_id, {})
-    user_sel["display_chat_id"] = message.chat.id
+    await send_welcome(message.chat.id)
 
-    # Проверяем, что фото есть, иначе используем заглушку
-    flat = Flats.get(index)
-    if not flat:
-        flat = {"photo": "https://via.placeholder.com/600x400.png?text=No+Image", "raw": None, "rooms": "—", "area": "—", "price": 0, "stage": "—"}
 
-    # Отправляем и сохраняем display message
-    sent = await safe_send_and_store(
-        message,
-        user_id,
-        flat["photo"],
-        caption=flat_caption(index),
-        reply_markup=main_keyboard(index, has_contact),
-        flat_index=index
+@dp.callback_query(lambda c: c.data and c.data.startswith("product_"))
+async def cb_switch_product(cb: CallbackQuery):
+    await send_product_overview(cb.message, cb.from_user.id)
+    await cb.answer()
+
+async def send_product_overview(message_obj: Message, user_id: int):
+    sel = user_selection.setdefault(user_id, {})
+    sel["at_menu"] = False
+    sel["display_msg_id"] = None
+    await message_obj.answer(GOODS_OVERVIEW_TEXT, reply_markup=goods_keyboard())
+
+
+@dp.callback_query(lambda c: c.data == "start_products")
+async def cb_start_products(cb: CallbackQuery):
+    await send_product_overview(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data == "start_promos")
+async def cb_start_promos(cb: CallbackQuery):
+    promo_text = (
+        "🔥 Акции LuxeBeauty:\n"
+        "• Скидка 15% на наборы ухода при покупке от двух позиций\n"
+        "• Подарок — мини-парфюм при заказе от 500 000 сум\n"
+        "• Бесплатная экспресс-доставка по Ташкенту от 300 000 сум\n\n"
+        "Напишите, чтобы забронировать акционные товары!"
     )
+    await cb.message.answer(promo_text)
+    sel = user_selection.setdefault(cb.from_user.id, {})
+    sel["at_menu"] = False
+    await cb.answer()
 
-    if sent is None:
-        # fallback: отправляем простой текст
-        await message.answer(flat_caption(index), reply_markup=main_keyboard(index, has_contact))
+
+@dp.callback_query(lambda c: c.data == "back_to_menu")
+async def cb_back_to_menu(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    sel = user_selection.setdefault(user_id, {})
+    if sel.get("at_menu"):
+        await cb.answer()
+        return
+    sel.pop("display_msg_id", None)
+    sel["at_menu"] = True
+    await send_welcome(cb.message.chat.id)
+    await cb.answer()
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("flat_"))
-async def cb_switch_flat(cb: CallbackQuery):
+@dp.callback_query(lambda c: c.data == "show_location")
+async def cb_show_location(cb: CallbackQuery):
+    location_text = (
+        "📍 Наш шоурум:\n"
+        "г. Ташкент, ТРЦ Riviera Plaza, 2 этаж\n"
+        "🕘 Ежедневно: 10:00–22:00\n"
+        "☎️ +998 90 555 44 33\n"
+        "🌐 https://maps.google.com/maps?q=41.327546,69.281541&ll=41.327546,69.281541&z=16"
+    )
+    try:
+        await cb.message.answer_location(latitude=41.327546, longitude=69.281541)
+    except Exception:
+        pass
+    await cb.message.answer(location_text)
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("order_"))
+async def cb_order(cb: CallbackQuery, state: FSMContext):
     user_id = cb.from_user.id
     try:
         idx = int(cb.data.split("_")[1])
     except Exception:
         idx = 1
-    if idx < 1:
-        idx = len(Flats)
-    if idx > len(Flats):
-        idx = 1
-    has_contact = bool(user_selection.get(user_id, {}).get("phone"))
 
-    # Пытаемся редактировать ранее отправленное сообщение
-    edited = await try_edit_display_message(user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    if not edited:
-        # fallback: отправим новое сообщение и сохраним его id (при отправке локального файла будем кэшировать file_id)
-        await safe_send_and_store(cb.message, user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "show_list")
-async def cb_show_list(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    if not user_selection.get(user_id, {}).get("phone"):
-        await request_contact_prompt(cb.message, user_id)
-        await cb.answer()
+    if idx not in Products:
+        await cb.answer("Товар не найден")
         return
-    rooms_counter = Counter([v["rooms"] for v in Flats.values()])
-    text = "📋 Список квартир:\n" + "\n".join([f"{rooms}-комнатных: {count} шт" for rooms, count in sorted(rooms_counter.items())])
-    edited = await try_edit_display_message(user_id, photo_value=None, caption=text, reply_markup=back_keyboard())
-    if not edited:
-        await safe_send_and_store(cb.message, user_id, None, caption=text, reply_markup=back_keyboard())
-    await cb.answer()
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("choose_"))
-async def cb_choose(cb: CallbackQuery, state: FSMContext):
-    user_id = cb.from_user.id
-    idx = int(cb.data.split("_")[1])
     sel = user_selection.setdefault(user_id, {})
-    sel["flat"] = idx
-    has_phone = bool(sel.get("phone"))
+    sel["product"] = idx
 
-    edited = await try_edit_display_message(user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=choose_keyboard(idx, has_contact=has_phone), flat_index=idx)
-    if not edited:
-        await safe_send_and_store(cb.message, user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=choose_keyboard(idx, has_contact=has_phone), flat_index=idx)
-
-    if not has_phone:
-        await request_contact_prompt(cb.message, user_id)
-        await state.set_state(CreditState.sending_phone)
-
-    if has_phone and GROUP_ID:
-        await send_or_update_manager_message(user_id)
-
-    await cb.answer()
-
-@dp.callback_query(lambda c: c.data == "back_to_list")
-async def cb_back_to_list(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    idx = user_selection.get(user_id, {}).get("flat", 1)
-    has_contact = bool(user_selection.get(user_id, {}).get("phone"))
-
-    edited = await try_edit_display_message(user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    if not edited:
-        await safe_send_and_store(cb.message, user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    await cb.answer()
-
-# ====== Новый хэндлер расчёта кредита ======
-@dp.callback_query(lambda c: c.data and c.data.startswith("calc_"))
-async def cb_calc(cb: CallbackQuery, state: FSMContext):
-    user_id = cb.from_user.id
-    idx = int(cb.data.split("_")[1])
-    sel = user_selection.setdefault(user_id, {})
-    sel["flat"] = idx
-
-    # Проверяем телефон
     if not sel.get("phone"):
         await request_contact_prompt(cb.message, user_id)
-        await state.set_state(CreditState.sending_phone)
+        await state.set_state(OrderState.sending_phone)
         await cb.answer()
         return
 
-    flat = Flats.get(idx)
-    if not flat:
-        await cb.message.answer("❌ Квартира не найдена.")
-        await cb.answer()
-        return
-
-    # Сохраняем стандартный первоначальный взнос 20% (можно изменить)
-    sel["downpayment"] = 20
-
-    # Запрашиваем только срок кредита
     await cb.message.answer(
-        f"💳 Рассчёт кредита для квартиры №{getattr(flat['raw'], 'number', '?')} ({flat['rooms']} комн., {flat['area']} м², {flat['price']}$)\n\n"
-        "Пожалуйста, введите срок кредита в месяцах или годах (например: 6мес или 2 года):"
+        f"📦 Укажите количество для «{Products[idx].get('name', 'товар')}». "
+        "Можно указать дробное значение и единицу измерения в сообщении, если это важно."
     )
-    await state.set_state(CreditState.waiting_term)
+    await state.set_state(OrderState.waiting_quantity)
     await cb.answer()
 
 
-# ====== Хэндлеры для срока и downpayment (оставлены как были) ======
-@dp.message(StateFilter(CreditState.waiting_term))
-async def set_term(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
-    months = None
-
-    if text.isdigit():
-        n = int(text)
-        if n < 6:
-            months = n * 12  # меньше 6 — это годы
-        else:
-            months = n       # 6 и больше — это месяцы
-    else:
-        match = re.match(r"(\d+)\s*(год|года|лет)", text)
-        if match:
-            months = int(match.group(1)) * 12
-        else:
-            match = re.match(r"(\d+)\s*мес", text)
-            if match:
-                months = int(match.group(1))
-
-    if not months or months < 6 or months > 60*12:
-        await message.answer("⚠️ Введите корректный срок (от 6 мес до 5 лет).")
-        return
-
-    sel = user_selection.get(message.from_user.id, {})
-    flat_idx = sel.get("flat", 1)
-    percent = sel.get("downpayment", 20)
-    flat = Flats.get(flat_idx, Flats[1])
-
-    initial, loan, payment, total, overpay = calc_credit(flat["price"], percent, months)
-    sel.update({
-        "months": months,
-        "payment": payment
-    })
-
-    result_text = (
-        f"🏠 Квартира: №{getattr(flat['raw'], 'number', '?')} ({flat['rooms']} комн.)\n"
-        f"💰 Первоначальный взнос: {percent}% ({initial}$)\n"
-        f"📅 Срок: {months} мес\n"
-        f"🏦 Сумма кредита: {loan}$\n"
-        f"💵 Ежемесячный платёж: {payment}$\n"
-        f"📊 Общая выплата: {total}$\n"
-    )
-
-    await message.answer(result_text, reply_markup=result_keyboard(flat_idx))
-    await state.clear()
+@dp.callback_query(lambda c: c.data == "request_phone")
+async def cb_request_phone(cb: CallbackQuery, state: FSMContext):
+    await request_contact_prompt(cb.message, cb.from_user.id)
+    await state.set_state(OrderState.sending_phone)
+    await cb.answer()
 
 
-@dp.message(StateFilter(CreditState.waiting_downpayment))
-async def set_downpayment(message: Message, state: FSMContext):
+@dp.message(StateFilter(OrderState.waiting_quantity))
+async def handle_quantity(message: Message, state: FSMContext):
+    text = (message.text or "").replace(",", ".").strip()
     try:
-        percent = int(message.text.strip())
-        if percent < 0 or percent > 100:
-            await message.answer("❌ Введите корректный процент (от 0 до 100).")
-            return
+        quantity_value = float(text)
+        if quantity_value <= 0:
+            raise ValueError
     except Exception:
-        await message.answer("⚠️ Введите число, например: 20")
+        await message.answer("❌ Введите положительное число. Примеры: 10 или 7.5")
         return
+
+    if quantity_value.is_integer():
+        quantity_str = str(int(quantity_value))
+    else:
+        quantity_str = str(quantity_value)
 
     sel = user_selection.setdefault(message.from_user.id, {})
-    sel["downpayment"] = percent
+    sel["quantity"] = quantity_str
 
-    await message.answer("Теперь введите срок кредита (от 6 мес до 5 лет). Например: 2 года или 24 мес.")
-    await state.set_state(CreditState.waiting_term)
+    await message.answer("📝 Добавьте комментарий к заказу или напишите «нет».")
+    await state.set_state(OrderState.waiting_comment)
 
 
-@dp.message(StateFilter(CreditState.waiting_term))
-async def set_term_2(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
-    months = None
-    if text.isdigit():
-        months = int(text)
-    else:
-        match = re.match(r"(\d+)\s*(год|года|лет)", text)
-        if match:
-            months = int(match.group(1)) * 12
-    if not months or months < 6 or months > 360:
-        await message.answer("⚠️ Введите корректный срок (от 6 до 60 месяцев).")
-        return
-    sel = user_selection.get(message.from_user.id, {})
-    flat_idx = sel.get("flat", 1)
-    percent = sel.get("downpayment", 20)
-    flat = Flats.get(flat_idx, Flats[1])
-    initial, loan, payment, total, overpay = calc_credit(flat["price"], percent, months)
-    sel.update({
-        "months": months,
-        "payment": payment
-    })
-    result_text = (
-        f"🏠 Квартира: №{getattr(flat['raw'], 'number', '?')} ({flat['rooms']} комн.)\n"
-        f"💰 Первоначальный взнос: {percent}% ({initial}$)\n"
-        f"📅 Срок: {months} мес\n"
-        f"🏦 Сумма кредита: {loan}$\n"
-        f"💵 Ежемесячный платёж: {payment}$\n"
-        f"📊 Общая выплата: {total}$\n"
+@dp.message(StateFilter(OrderState.waiting_comment))
+async def handle_comment(message: Message, state: FSMContext):
+    comment = (message.text or "").strip()
+    if comment.lower() in {"нет", "no", "-", "без комментариев"}:
+        comment = ""
+
+    sel = user_selection.setdefault(message.from_user.id, {})
+    sel["comment"] = comment
+
+    persist_contact_to_csv(message.from_user.id)
+
+    if GROUP_ID:
+        await send_or_update_manager_message(message.from_user.id)
+
+    await message.answer(
+        "✅ Спасибо! Заявка отправлена менеджеру. Мы свяжемся с вами в ближайшее время.",
+        reply_markup=types.ReplyKeyboardRemove(),
     )
-    await message.answer(result_text, reply_markup=result_keyboard(flat_idx))
     await state.clear()
 
-@dp.callback_query(lambda c: c.data == "new_calc")
-async def cb_new_calc(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    idx = user_selection.get(user_id, {}).get("flat", 1)
-    has_contact = bool(user_selection.get(user_id, {}).get("phone"))
-    edited = await try_edit_display_message(user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    if not edited:
-        await safe_send_and_store(cb.message, user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    await cb.answer()
 
-@dp.callback_query(lambda c: c.data == "back_to_flats")
-async def cb_back_to_flats(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    idx = user_selection.get(user_id, {}).get("flat", 1)
-    has_contact = bool(user_selection.get(user_id, {}).get("phone"))
-    edited = await try_edit_display_message(user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    if not edited:
-        await safe_send_and_store(cb.message, user_id, Flats[idx]["photo"], caption=flat_caption(idx), reply_markup=main_keyboard(idx, has_contact), flat_index=idx)
-    await cb.answer()
-
-@dp.message(StateFilter(CreditState.sending_phone))
+@dp.message(StateFilter(OrderState.sending_phone))
 async def handle_phone(message: Message, state: FSMContext):
-    phone = message.contact.phone_number if message.contact else message.text.strip()
+    phone = message.contact.phone_number if message.contact else (message.text or "").strip()
 
-    # ✅ Проверка: оставляем только цифры
     phone = "".join(filter(str.isdigit, phone))
-
-    # ✅ Проверка: только цифры и длина 9–15
     if not (phone.isdigit() and 9 <= len(phone) <= 15):
         await message.answer("❌ Введите корректный номер телефона — только цифры, длиной от 9 до 15.")
         return
 
-    # ⬇️ остальной твой код без изменений
     sel = user_selection.setdefault(message.from_user.id, {})
     sel["phone"] = phone
     sel["username"] = message.from_user.username or ""
@@ -779,38 +750,16 @@ async def handle_phone(message: Message, state: FSMContext):
     except Exception:
         logging.exception("Не удалось создать фоновую задачу для отложенной отправки контакта.")
 
-    if sel.get("flat") and GROUP_ID:
+    if sel.get("product") and GROUP_ID:
         await send_or_update_manager_message(message.from_user.id)
 
     await message.answer("✅ Спасибо! Номер сохранён. Теперь доступны все действия.", reply_markup=types.ReplyKeyboardRemove())
     await message.answer(
-    "🇷🇺 Добро пожаловать в Royal Residence.\n"
-    "Я — ваш AI-менеджер по продажам, созданный, чтобы помочь вам найти идеальную квартиру.\n"
-    "Подберу лучшие варианты, покажу планировки и помогу рассчитать ипотеку.\n\n"
-    "Пожалуйста, уточните ваши пожелания — количество комнат, этаж, площадь или бюджет.\n\n"
-    "Это поможет подобрать самые подходящие варианты 🏙 \n\n"
-    "С чего начнём поиск?\n\n"
-
-    "🇺🇿 Royal Residence-ga xush kelibsiz.\n"
-    "Men sizning AI savdo menejeringizman, u sizga mukammal kvartirani topishga yordam berish uchun yaratilgan.\n"
-    "Men eng yaxshi variantlarni tanlayman, sizga qavat rejalarini ko'rsataman va ipotekani hisoblashingizga yordam beraman.\n\n"
-
-    "Iltimos, afzalliklaringizni belgilang - xonalar soni, qavat, maydon va byudjet.\n\n"
-
-    "Bu sizga eng mos variantlarni topishga yordam beradi 🏙\n\n"
-
-    "Qidiruvni qayerdan boshlaymiz?\n\n"
-
-    "🇬🇧 Welcome to Royal Residence.\n"
-    "I’m your AI Sales Manager, here to help you find the perfect apartment.\n"
-    "I’ll select the best options, show you floor plans, and assist with mortgage calculations.\n\n"
-
-    "Please tell me your preferences — number of rooms, floor, area, or budget.\n\n"
-
-    "This will help me find the most suitable options for you 🏙\n\n"
-
-    "Where would you like to start your search?\n\n"
-)
+        "🇷🇺 Добро пожаловать в LuxeBeauty — бутик косметики и ухода.\n"
+        "Я помогу подобрать уход за кожей, макияж, парфюмерию и подарочные наборы. Напишите о типе кожи, поводе или бюджете — подберу лучшие варианты.\n\n"
+        "🇺🇿 LuxeBeauty go'zallik va parvarish butikiga xush kelibsiz.\n"
+        "Men sizga teri parvarishi, makiyaj, atirlar va sovg'a to'plamlarini tanlashda yordam beraman. Teri turi, holat yoki byudjetni yozing — mos mahsulotlarni tavsiya qilaman.\n"
+    )
 
     await state.clear()
 
@@ -819,123 +768,121 @@ async def handle_phone(message: Message, state: FSMContext):
 async def handle_question(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # 🧩 Если пользователь отправил контакт — сразу обрабатываем его
     if message.contact:
         await handle_phone(message, state)
         return
 
     sel = user_selection.setdefault(user_id, {})
 
-    # 🚫 Проверяем — если нет телефона
     if not sel.get("phone"):
         await message.answer(
-            "📲 Пожалуйста, сначала отправьте ваш номер телефона, чтобы продолжить.",
+            "📲 Пожалуйста, сначала отправьте номер телефона, чтобы продолжить консультацию.",
             reply_markup=types.ReplyKeyboardMarkup(
                 keyboard=[[types.KeyboardButton(text="Отправить контакт", request_contact=True)]],
                 resize_keyboard=True,
-                one_time_keyboard=True
-            )
+                one_time_keyboard=True,
+            ),
         )
-        await state.set_state(CreditState.sending_phone)
+        await state.set_state(OrderState.sending_phone)
         return
 
-    question = message.text.strip()
+    question = (message.text or "").strip()
     if not question:
-        await message.answer("⚠️ Пустой вопрос. Напишите текст.")
+        await message.answer("⚠️ Пустой вопрос. Напишите, какое средство или задачу нужно решить.")
         return
-    
-    try:
-        # 🔹 GPT-ответ с фото
-        logging.info("Пользователь запросил у GPT: %s", question)
 
-        # --- сразу показываем "печатает..." ---
+    try:
+        logging.info("Пользователь запросил подбор косметики: %s", question)
+
         try:
             await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         except Exception:
             pass
 
-        # --- Сохраняем сообщение пользователя в истории (чтобы диалог был полным) ---
         try:
-            # гарантируем, что openai_func.user_conversations существует и это dict-like
             if not hasattr(openai_func, "user_conversations"):
                 openai_func.user_conversations = defaultdict(list)
-            openai_func.user_conversations[message.from_user.id].append({
-                "role": "user",
-                "content": question
-            })
+            openai_func.user_conversations[user_id].append(
+                {"role": "user", "content": question}
+            )
         except Exception:
             logging.exception("Не удалось сохранить сообщение пользователя в user_conversations.")
 
-        # ---- ВАЖНО: ask_openai_sync в openai_func — асинхронная функция, поэтому ждём результат с await ----
         response = await openai_func.ask_openai_sync(user_id, message.text, bot=bot, chat_id=message.chat.id)
 
-        # --- После получения ответа сохраняем ответы ассистента в истории ---
         try:
-            # Нормализуем разные типы ответов и добавляем как assistant messages
             if isinstance(response, dict):
-                # Если есть flats -> добавляем каждый текст ответа
-                if "flats" in response:
-                    for flat in response["flats"]:
-                        content = flat.get("text") or ""
+                meta = response.get("meta") or {}
+                if meta.get("display_text") and response.get("text"):
+                    openai_func.user_conversations[user_id].append(
+                        {"role": "assistant", "content": response["text"]}
+                    )
+
+                if "products" in response:
+                    for product in response["products"]:
+                        content = product.get("text") or ""
                         if content:
-                            openai_func.user_conversations[message.from_user.id].append({
-                                "role": "assistant",
-                                "content": content
-                            })
+                            openai_func.user_conversations[user_id].append(
+                                {"role": "assistant", "content": content}
+                            )
                 elif "text" in response:
                     content = response.get("text") or ""
                     if content:
-                        openai_func.user_conversations[message.from_user.id].append({
-                            "role": "assistant",
-                            "content": content
-                        })
+                        openai_func.user_conversations[user_id].append(
+                            {"role": "assistant", "content": content}
+                        )
                 else:
-                    # fallback: stringify dict
-                    openai_func.user_conversations[message.from_user.id].append({
-                        "role": "assistant",
-                        "content": str(response)
-                    })
+                    openai_func.user_conversations[user_id].append(
+                        {"role": "assistant", "content": str(response)}
+                    )
             else:
-                # response could be plain string
-                openai_func.user_conversations[message.from_user.id].append({
-                    "role": "assistant",
-                    "content": str(response)
-                })
+                openai_func.user_conversations[user_id].append(
+                    {"role": "assistant", "content": str(response)}
+                )
         except Exception:
             logging.exception("Не удалось добавить ответ ассистента в user_conversations.")
 
-        # --- Отправляем ответ пользователю (в зависимости от структуры) ---
         if isinstance(response, dict):
-            if "flats" in response:
-                for flat in response["flats"]:
-                    logging.info("Отправка варианта квартиры от GPT (печатает...)")
+            if "products" in response:
+                meta = response.get("meta") or {}
+                if meta.get("display_text") and response.get("text"):
+                    logging.info("Отправка текстового ответа с описанием (печатает...)")
                     try:
                         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
                     except Exception:
                         pass
-                    logging.info("печатает...")
-                    # небольшая пауза, чтобы статус видел пользователь
                     await asyncio.sleep(1)
-                    if flat.get("photo"):
-                        await bot.send_photo(chat_id=message.chat.id, photo=flat["photo"], caption=flat["text"])
+                    await bot.send_message(chat_id=message.chat.id, text=response["text"])
+
+                for product in response["products"]:
+                    logging.info("Отправка рекомендованного товара от GPT (печатает...)")
+                    try:
+                        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    text = product.get("text") or "Описание товара отсутствует."
+                    photo = product.get("photo")
+                    if product.get("product_index") and product["product_index"] in Products:
+                        sel["product"] = product["product_index"]
+                    if photo:
+                        await bot.send_photo(chat_id=message.chat.id, photo=photo, caption=text)
                     else:
-                        await bot.send_message(chat_id=message.chat.id, text=flat["text"])
+                        await bot.send_message(chat_id=message.chat.id, text=text)
             elif response.get("photo"):
                 logging.info("Отправка фото-ответа от GPT (печатает...)")
                 try:
                     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
                 except Exception:
                     pass
-                logging.info("печатает...")
                 await asyncio.sleep(1)
                 await bot.send_photo(chat_id=message.chat.id, photo=response["photo"], caption=response.get("text", ""))
             else:
-                logging.info("Отправка текст-ответа от GPT (печатает...)")
+                logging.info("Отправка текстового ответа от GPT (печатает...)")
                 try:
                     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
                 except Exception:
                     pass
-                logging.info("печатает...")
                 await asyncio.sleep(1)
                 await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
         else:
@@ -944,14 +891,11 @@ async def handle_question(message: Message, state: FSMContext):
                 await bot.send_chat_action(chat_id=message.chat.id, action="typing")
             except Exception:
                 pass
-            logging.info("печатает...")
             await asyncio.sleep(1)
             await bot.send_message(chat_id=message.chat.id, text=str(response))
 
-        # Обновляем менеджерское сообщение (если нужно)
         if GROUP_ID:
-            await send_or_update_manager_message(message.from_user.id)
-
+            await send_or_update_manager_message(user_id)
 
     except Exception as e:
         err = str(e)
@@ -959,25 +903,48 @@ async def handle_question(message: Message, state: FSMContext):
             answer = "⚠️ Ошибка авторизации OpenAI (401). Проверьте API_KEY."
         else:
             answer = f"⚠️ Ошибка GPT: {e}"
-        await message.answer(answer, reply_markup=back_keyboard())
+        await message.answer(answer, reply_markup=start_keyboard())
 
 
 # ====== Запуск бота ======
 async def main():
-    await load_flats()
+    await load_products()
     logging.info("Бот загружен и готов. Запуск polling...")
+    async def _shutdown():
+        storage = getattr(dp, "storage", None)
+        if storage:
+            for method_name in ("close", "wait_closed"):
+                method = getattr(storage, method_name, None)
+                if callable(method):
+                    result = method()
+                    if inspect.isawaitable(result):
+                        await result
+        session = getattr(bot, "session", None)
+        if session:
+            close_method = getattr(session, "close", None)
+            if callable(close_method):
+                result = close_method()
+                if inspect.isawaitable(result):
+                    await result
+
     while True:
         try:
             await dp.start_polling(bot)
         except exceptions.TelegramNetworkError:
             logging.warning("❌ Ошибка сети Telegram, переподключаемся через 3 сек...")
             await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logging.info("⏹️ Получен сигнал остановки polling, завершаем работу.")
+            await _shutdown()
+            return
         except KeyboardInterrupt:
             logging.info("🛑 Бот остановлен вручную")
-            break
+            await _shutdown()
+            return
         except Exception:
             logging.exception("Неожиданная ошибка в polling, перезапуск через 3 сек...")
             await asyncio.sleep(5)
+    await _shutdown()
 
 async def show_typing(bot, chat_id: int):
     """Постоянно показывает 'печатает...', пока задача не отменена"""
@@ -990,4 +957,9 @@ async def show_typing(bot, chat_id: int):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 Запуск остановлен пользователем.")
+    except asyncio.CancelledError:
+        logging.info("⏹️ Поллинг отменён и приложение завершено.")
