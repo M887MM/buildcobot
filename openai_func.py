@@ -2043,6 +2043,7 @@ def search_products(
     limit: int = PRODUCT_PAGE_SIZE,
     user_profile: Optional[dict] = None,
 ) -> Tuple[List[dict], List[ProductLike], Optional[int], List[dict], List[str]]:
+    stopword_set = TOKEN_SEARCH_STOPWORDS.get(lang, TOKEN_SEARCH_STOPWORDS["default"])
     tokens = _filter_search_tokens(tokenize(query), lang)
     simple_tokens = _filter_search_tokens(_tokenize_simple(query), lang)
     simple_token_set = set(simple_tokens)
@@ -2060,6 +2061,8 @@ def search_products(
     index_map: dict[int, int] = {}
     category_map: dict[str, str] = {}
     category_tokens_map: dict[str, set[str]] = {}
+    product_text_cache: dict[int, str] = {}
+    product_name_cache: dict[int, str] = {}
     for idx, product in enumerate(products, start=1):
         product_id = getattr(product, "id", None)
         if product_id is not None:
@@ -2091,18 +2094,20 @@ def search_products(
         score = calculate_match_score(product, tokens)
         if not tokens and not price_limit:
             score = max(score, 1)
-        if profile_skin and skin_keyword_set:
+        product_key = getattr(product, "id", None) or id(product)
+        base_fields = product_text_cache.get(product_key)
+        normalized_name = product_name_cache.get(product_key)
+        if base_fields is None or normalized_name is None:
+            normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+            normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+            normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
+            normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
             base_fields = " ".join(
-                filter(
-                    None,
-                    [
-                        (normalize_text(getattr(product, "name", "") or "") or "").lower(),
-                        (normalize_text(getattr(product, "category", "") or "") or "").lower(),
-                        (normalize_text(getattr(product, "description", "") or "") or "").lower(),
-                        (normalize_text(getattr(product, "tags", "") or "") or "").lower(),
-                    ],
-                )
+                filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
             )
+            product_text_cache[product_key] = base_fields
+            product_name_cache[product_key] = normalized_name
+        if profile_skin and skin_keyword_set:
             if any(keyword in base_fields for keyword in skin_keyword_set):
                 score += 3
         if score > 0:
@@ -2117,9 +2122,40 @@ def search_products(
     if not matches and tokens:
         # попытка по частичному совпадению
         for product in products:
-            name = (getattr(product, "name", "") or "").lower()
+            product_key = getattr(product, "id", None) or id(product)
+            name = product_name_cache.get(product_key)
+            if name is None:
+                name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                product_name_cache[product_key] = name
             if any(token in name for token in tokens):
                 matches.append((1, product))
+
+    if not matches:
+        raw_tokens = [
+            token
+            for token in _tokenize_simple(query)
+            if len(token) > 2 and token not in stopword_set
+        ]
+        fallback_matches: List[Tuple[int, ProductLike]] = []
+        if raw_tokens:
+            for product in products:
+                product_key = getattr(product, "id", None) or id(product)
+                base_fields = product_text_cache.get(product_key)
+                if base_fields is None:
+                    normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                    normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+                    normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
+                    normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
+                    base_fields = " ".join(
+                        filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
+                    )
+                    product_text_cache[product_key] = base_fields
+                    product_name_cache.setdefault(product_key, normalized_name)
+                hits = sum(1 for token in raw_tokens if token in base_fields)
+                if hits:
+                    fallback_matches.append((hits + 1, product))
+        if fallback_matches:
+            matches = fallback_matches
 
     matches_before_category = matches[:]
 
@@ -2156,14 +2192,16 @@ def search_products(
             mentioned_categories = set()
             mentioned_aliases = set()
         else:
-            return [], [], price_limit, [], sorted(mentioned_categories)
+            matches = [(1, product) for product in products]
+            mentioned_categories = set()
+            mentioned_aliases = set()
 
     if not matches:
-        if mentioned_aliases:
+        if force_listing or mentioned_aliases:
+            matches = [(1, product) for product in products]
+            mentioned_categories = set()
+        else:
             return [], [], price_limit, [], sorted(mentioned_categories)
-        if not force_listing:
-            return [], [], price_limit, [], sorted(mentioned_categories)
-        matches = [(1, product) for product in products]
 
     def sort_key(pair: Tuple[int, ProductLike]):
         score, product = pair
