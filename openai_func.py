@@ -4,7 +4,7 @@ import time
 import os
 import re
 from collections import defaultdict
-from typing import List, Optional, Tuple, Protocol
+from typing import Iterable, List, Optional, Tuple, Protocol
 from types import SimpleNamespace
 from difflib import SequenceMatcher
 
@@ -43,6 +43,23 @@ CLAUDE_MODEL = "claude-3-5-haiku-latest"
 PLACEHOLDER_PHOTO = "https://via.placeholder.com/600x400.png?text=No+Image"
 CATEGORY_MATCH_BOOST = 2
 LLM_PROVIDER_ORDER_ENV = os.getenv("LLM_PROVIDER_ORDER")
+GENERIC_PRODUCT_TOKENS = {
+    "крем",
+    "крема",
+    "кремы",
+    "creme",
+    "cream",
+    "косметика",
+    "средство",
+    "средства",
+    "уход",
+    "уходовый",
+    "beauty",
+    "product",
+    "товар",
+    "товары",
+    "care",
+}
 
 ANTHROPIC_ENABLED = os.getenv("ANTHROPIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 _claude_client = None
@@ -1292,6 +1309,21 @@ def _tokenize_simple(text: str) -> List[str]:
     return [token.replace("ё", "е") for token in re.findall(r"[a-zа-я0-9]+", text.lower()) if token]
 
 
+def _expand_token_set(tokens: Iterable[str]) -> set[str]:
+    expanded: set[str] = set()
+    for token in tokens:
+        if not token:
+            continue
+        normalized = _normalize_category_token(token.replace("ё", "е"))
+        if len(normalized) > 2:
+            expanded.add(normalized)
+        for variant in _token_variants(token):
+            variant_norm = _normalize_category_token(variant.replace("ё", "е"))
+            if len(variant_norm) > 2:
+                expanded.add(variant_norm)
+    return expanded
+
+
 def _semantic_similarity_score(query: str, text: str) -> float:
     if not query or not text:
         return 0.0
@@ -2125,6 +2157,10 @@ def search_products(
         if token in {"лицо", "губы", "волосы", "кожа", "глаза"}
     }
     missing_category_candidates: set[str] = set()
+    query_token_pool = _expand_token_set(tokens) | _expand_token_set(simple_tokens)
+    if not query_token_pool and normalized_simple_tokens:
+        query_token_pool = set(normalized_simple_tokens)
+    significant_query_tokens = {token for token in query_token_pool if token not in GENERIC_PRODUCT_TOKENS}
 
     index_map: dict[int, int] = {}
     category_map: dict[str, str] = {}
@@ -2132,6 +2168,7 @@ def search_products(
     product_text_cache: dict[int, str] = {}
     product_name_cache: dict[int, str] = {}
     product_token_cache: dict[int, set[str]] = {}
+    product_match_stat: dict[int, Tuple[int, int]] = {}
     for idx, product in enumerate(products, start=1):
         product_id = getattr(product, "id", None)
         if product_id is not None:
@@ -2177,13 +2214,20 @@ def search_products(
             )
             product_text_cache[product_key] = base_fields
             product_name_cache[product_key] = normalized_name
-            tokens_for_product = {
-                _normalize_category_token(token)
-                for token in _tokenize_simple(base_fields)
-            }
+            tokens_for_product = _expand_token_set(_tokenize_simple(base_fields))
             product_token_cache[product_key] = tokens_for_product
         else:
             tokens_for_product = product_token_cache[product_key]
+        if query_token_pool:
+            match_tokens = tokens_for_product & query_token_pool
+            significant_matches = match_tokens & significant_query_tokens if significant_query_tokens else set()
+            if not match_tokens:
+                continue
+            if significant_query_tokens and not significant_matches:
+                continue
+            product_match_stat[product_key] = (len(match_tokens), len(significant_matches))
+        else:
+            product_match_stat[product_key] = (0, 0)
         if profile_skin and skin_keyword_set:
             if any(keyword in base_fields for keyword in skin_keyword_set):
                 score += 3
@@ -2194,6 +2238,18 @@ def search_products(
         for product in products:
             price = getattr(product, "price", None)
             if price and price <= price_limit * 1.15:
+                product_key = getattr(product, "id", None) or id(product)
+                tokens_for_product = product_token_cache.get(product_key) or set()
+                if query_token_pool:
+                    match_tokens = tokens_for_product & query_token_pool
+                    significant_matches = match_tokens & significant_query_tokens if significant_query_tokens else set()
+                    if not match_tokens:
+                        continue
+                    if significant_query_tokens and not significant_matches:
+                        continue
+                    product_match_stat[product_key] = (len(match_tokens), len(significant_matches))
+                else:
+                    product_match_stat[product_key] = (0, 0)
                 matches.append((1, product))
 
     if not matches and tokens:
@@ -2205,6 +2261,17 @@ def search_products(
                 name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
                 product_name_cache[product_key] = name
             if any(token in name for token in tokens):
+                tokens_for_product = product_token_cache.get(product_key) or set()
+                if query_token_pool:
+                    match_tokens = tokens_for_product & query_token_pool
+                    significant_matches = match_tokens & significant_query_tokens if significant_query_tokens else set()
+                    if not match_tokens:
+                        continue
+                    if significant_query_tokens and not significant_matches:
+                        continue
+                    product_match_stat[product_key] = (len(match_tokens), len(significant_matches))
+                else:
+                    product_match_stat[product_key] = (0, 0)
                 matches.append((1, product))
 
     if not matches:
@@ -2228,8 +2295,22 @@ def search_products(
                     )
                     product_text_cache[product_key] = base_fields
                     product_name_cache.setdefault(product_key, normalized_name)
+                tokens_for_product = product_token_cache.get(product_key)
+                if tokens_for_product is None:
+                    tokens_for_product = _expand_token_set(_tokenize_simple(base_fields))
+                    product_token_cache[product_key] = tokens_for_product
                 hits = sum(1 for token in raw_tokens if token in base_fields)
                 if hits:
+                    if query_token_pool:
+                        match_tokens = tokens_for_product & query_token_pool
+                        significant_matches = match_tokens & significant_query_tokens if significant_query_tokens else set()
+                        if not match_tokens:
+                            continue
+                        if significant_query_tokens and not significant_matches:
+                            continue
+                        product_match_stat[product_key] = (len(match_tokens), len(significant_matches))
+                    else:
+                        product_match_stat[product_key] = (0, 0)
                     fallback_matches.append((hits + 1, product))
         if fallback_matches:
             matches = fallback_matches
@@ -2251,7 +2332,13 @@ def search_products(
                 product_text_cache[product_key] = base_fields
                 product_name_cache.setdefault(product_key, normalized_name)
             semantic_score = _semantic_similarity_score(query_semantic, base_fields)
-            boosted_score = score + int(round(semantic_score * 10))
+            match_count, significant_count = product_match_stat.get(product_key, (0, 0))
+            boosted_score = (
+                score
+                + int(round(semantic_score * 8))
+                + significant_count * 3
+                + max(0, match_count - significant_count)
+            )
             boosted_matches.append((boosted_score, product))
         matches = boosted_matches
 
