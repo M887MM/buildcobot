@@ -440,6 +440,18 @@ def _normalize_media_url(url: str) -> str:
     except Exception:
         return cleaned
 
+def _shorten(text: str, limit: int = 120) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+def _describe_media_source(value) -> str:
+    if isinstance(value, str):
+        return _shorten(_sanitize_media_value(value))
+    if isinstance(value, dict):
+        return f"dict_keys={list(value.keys())}"
+    return repr(value)
+
 def prepare_photo_for_send(photo_value):
     """
     Возвращает:
@@ -898,7 +910,10 @@ async def handle_question(message: Message, state: FSMContext):
                                 else:
                                     await bot.send_message(chat_id=message.chat.id, text=text)
                             except Exception:
-                                logging.exception("Не удалось отправить фото товара, отправляем текст.")
+                                logging.exception(
+                                    "Не удалось отправить фото товара (%s), отправляем текст.",
+                                    _describe_media_source(photo),
+                                )
                                 await bot.send_message(chat_id=message.chat.id, text=text)
                         else:
                             await bot.send_message(chat_id=message.chat.id, text=text)
@@ -921,7 +936,10 @@ async def handle_question(message: Message, state: FSMContext):
                         else:
                             await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
                     except Exception:
-                        logging.exception("Не удалось отправить фото-ответ, отправляем текст.")
+                        logging.exception(
+                            "Не удалось отправить фото-ответ (%s), отправляем текст.",
+                            _describe_media_source(response.get("photo")),
+                        )
                         await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
                 else:
                     await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))

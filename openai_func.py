@@ -248,6 +248,9 @@ TOKEN_SEARCH_STOPWORDS = {
         "покажи",
         "покажите",
         "можно",
+        "можешь",
+        "подскажешь",
+        "подскажите",
         "интересуют",
         "интересует",
         "что",
@@ -389,6 +392,7 @@ SYNONYM_PREFIXES = {
     "тональн": {"foundation", "тоналка", "bb", "cc"},
     "сыворот": {"серум", "serum", "ampoule"},
     "парфюм": {"аромат", "fragrance", "духи"},
+    "lip": {"губы", "balm"},
 }
 
 SYNONYM_EXACT = {
@@ -400,10 +404,26 @@ SYNONYM_EXACT = {
     "ampoule": {"сыворотка"},
     "duhi": {"аромат"},
     "духи": {"аромат"},
+    "balm": {"губы"},
+    "бальзам": {"губы"},
+    "lipstick": {"губы"},
+    "lipbalm": {"губы"},
 }
 
 PRODUCT_PAGE_SIZE = 4
-PRODUCT_CACHE_TTL = 60  # seconds
+
+
+def _get_product_cache_ttl() -> int:
+    raw = os.getenv("PRODUCT_CACHE_TTL", "60")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Некорректное значение PRODUCT_CACHE_TTL='%s', используем 60 секунд.", raw)
+        return 60
+    return max(0, value)
+
+
+PRODUCT_CACHE_TTL = _get_product_cache_ttl()
 PRODUCT_CACHE = {"items": None, "loaded_at": 0.0}
 user_product_sessions: dict[int, dict] = {}
 user_short_memory: defaultdict[int, dict] = defaultdict(dict)
@@ -416,6 +436,11 @@ CATEGORY_TOKEN_ALIASES = {
     "лицу": "лицо",
     "лице": "лицо",
     "лицом": "лицо",
+    "лицевой": "лицо",
+    "лицевое": "лицо",
+    "лицевого": "лицо",
+    "лицевым": "лицо",
+    "лицев": "лицо",
     "facial": "лицо",
     "face": "лицо",
     "skin": "кожа",
@@ -434,6 +459,10 @@ CATEGORY_TOKEN_ALIASES = {
     "губа": "губы",
     "губы": "губы",
     "lips": "губы",
+    "губной": "губы",
+    "губная": "губы",
+    "губного": "губы",
+    "lip": "губы",
 }
 
 RECOMMENDATION_LANGUAGE_HINTS = {
@@ -1755,6 +1784,9 @@ def load_active_products(force: bool = False) -> List[ProductLike]:
     cached_items = PRODUCT_CACHE.get("items")
     loaded_at = PRODUCT_CACHE.get("loaded_at", 0.0)
 
+    if PRODUCT_CACHE_TTL <= 0:
+        force = True
+
     if not force and cached_items is not None and (now - loaded_at) < PRODUCT_CACHE_TTL:
         return cached_items
 
@@ -2159,6 +2191,11 @@ def search_products(
 
     matches_before_category = matches[:]
 
+    if not force_listing:
+        area_tokens = {token for token in normalized_simple_tokens if token in CATEGORY_TOKEN_ALIASES.values()}
+        if area_tokens:
+            force_listing = True
+
     mentioned_categories: set[str] = set()
     for alias_norm, original_name in category_map.items():
         if not alias_norm:
@@ -2197,9 +2234,10 @@ def search_products(
             mentioned_aliases = set()
 
     if not matches:
-        if force_listing or mentioned_aliases:
+        if products:
             matches = [(1, product) for product in products]
             mentioned_categories = set()
+            force_listing = True
         else:
             return [], [], price_limit, [], sorted(mentioned_categories)
 
