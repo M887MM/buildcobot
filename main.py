@@ -8,6 +8,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from aiogram import Bot, Dispatcher, exceptions, types
 from aiogram.enums import ParseMode
@@ -421,6 +422,24 @@ async def request_contact_prompt(message_or_obj, user_id):
 def is_url(s: str) -> bool:
     return isinstance(s, str) and s.startswith(("http://", "https://"))
 
+def _sanitize_media_value(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip().replace("\r", "").replace("\n", "")
+    return cleaned
+
+def _normalize_media_url(url: str) -> str:
+    cleaned = _sanitize_media_value(url)
+    if not cleaned:
+        return cleaned
+    try:
+        parts = urlsplit(cleaned)
+        path = quote(parts.path or "", safe="/%")
+        query = quote(parts.query or "", safe="=&?")
+        return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+    except Exception:
+        return cleaned
+
 def prepare_photo_for_send(photo_value):
     """
     Возвращает:
@@ -433,10 +452,13 @@ def prepare_photo_for_send(photo_value):
         return None
     # already a file_id saved as string?
     if isinstance(photo_value, str):
-        if is_url(photo_value):
-            return ('url', photo_value)
+        cleaned = _sanitize_media_value(photo_value)
+        if not cleaned:
+            return None
+        if is_url(cleaned):
+            return ('url', _normalize_media_url(cleaned))
         # локальный путь: делаем абсолютный путь
-        p = os.path.expanduser(photo_value)
+        p = os.path.expanduser(cleaned)
         p = os.path.abspath(p)
         if os.path.exists(p) and os.path.isfile(p):
             try:
@@ -445,9 +467,9 @@ def prepare_photo_for_send(photo_value):
                 logging.exception("Не удалось создать InputFile для %s", p)
                 return None
         # может это уже file_id (не очень вероятно, но поддержим)
-        if photo_value.isdigit() or '/' not in photo_value and len(photo_value) > 30:
+        if cleaned.isdigit() or '/' not in cleaned and len(cleaned) > 30:
             # heuristics: long token without slash could be file_id
-            return ('file_id', photo_value)
+            return ('file_id', cleaned)
         return None
     # If it's already aiogram InputFile
     if isinstance(photo_value, types.InputFile):
@@ -866,7 +888,20 @@ async def handle_question(message: Message, state: FSMContext):
                     if product.get("product_index") and product["product_index"] in Products:
                         sel["product"] = product["product_index"]
                     if photo:
-                        await bot.send_photo(chat_id=message.chat.id, photo=photo, caption=text)
+                        prepared = prepare_photo_for_send(photo)
+                        if prepared:
+                            try:
+                                if prepared[0] in ("url", "file_id"):
+                                    await bot.send_photo(chat_id=message.chat.id, photo=prepared[1], caption=text)
+                                elif prepared[0] == "file":
+                                    await bot.send_photo(chat_id=message.chat.id, photo=prepared[1], caption=text)
+                                else:
+                                    await bot.send_message(chat_id=message.chat.id, text=text)
+                            except Exception:
+                                logging.exception("Не удалось отправить фото товара, отправляем текст.")
+                                await bot.send_message(chat_id=message.chat.id, text=text)
+                        else:
+                            await bot.send_message(chat_id=message.chat.id, text=text)
                     else:
                         await bot.send_message(chat_id=message.chat.id, text=text)
             elif response.get("photo"):
@@ -876,7 +911,20 @@ async def handle_question(message: Message, state: FSMContext):
                 except Exception:
                     pass
                 await asyncio.sleep(1)
-                await bot.send_photo(chat_id=message.chat.id, photo=response["photo"], caption=response.get("text", ""))
+                prepared = prepare_photo_for_send(response["photo"])
+                if prepared:
+                    try:
+                        if prepared[0] in ("url", "file_id"):
+                            await bot.send_photo(chat_id=message.chat.id, photo=prepared[1], caption=response.get("text", ""))
+                        elif prepared[0] == "file":
+                            await bot.send_photo(chat_id=message.chat.id, photo=prepared[1], caption=response.get("text", ""))
+                        else:
+                            await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
+                    except Exception:
+                        logging.exception("Не удалось отправить фото-ответ, отправляем текст.")
+                        await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
+                else:
+                    await bot.send_message(chat_id=message.chat.id, text=response.get("text", str(response)))
             else:
                 logging.info("Отправка текстового ответа от GPT (печатает...)")
                 try:

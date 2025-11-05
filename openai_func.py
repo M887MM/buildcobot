@@ -250,6 +250,10 @@ TOKEN_SEARCH_STOPWORDS = {
         "можно",
         "интересуют",
         "интересует",
+        "что",
+        "тебя",
+        "тебе",
+        "для",
     },
     "en": {
         "what",
@@ -404,6 +408,7 @@ PRODUCT_CACHE = {"items": None, "loaded_at": 0.0}
 user_product_sessions: dict[int, dict] = {}
 user_short_memory: defaultdict[int, dict] = defaultdict(dict)
 USER_MEMORY_HISTORY_SIZE = 5
+CATEGORY_MATCH_BONUS = 2
 
 CATEGORY_TOKEN_ALIASES = {
     "лицо": "лицо",
@@ -2116,6 +2121,8 @@ def search_products(
             if any(token in name for token in tokens):
                 matches.append((1, product))
 
+    matches_before_category = matches[:]
+
     mentioned_categories: set[str] = set()
     for alias_norm, original_name in category_map.items():
         if not alias_norm:
@@ -2141,9 +2148,13 @@ def search_products(
             product_category = normalize_text(getattr(product, "category", "") or "") or ""
             product_alias = product_category.lower().replace("ё", "е")
             if product_alias in mentioned_aliases:
-                filtered_matches.append((score, product))
+                filtered_matches.append((score + CATEGORY_MATCH_BONUS, product))
         if filtered_matches:
             matches = filtered_matches
+        elif matches_before_category:
+            matches = matches_before_category
+            mentioned_categories = set()
+            mentioned_aliases = set()
         else:
             return [], [], price_limit, [], sorted(mentioned_categories)
 
