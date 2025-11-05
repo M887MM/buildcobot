@@ -1021,11 +1021,15 @@ def _build_analog_intro(lang: str, topic: str) -> str:
 def _is_availability_followup(normalized_query: str, tokens: List[str], lang: str) -> bool:
     if not normalized_query:
         return False
+    token_set = set(tokens)
+    structural_tokens = {"что", "какие", "какой", "какая", "каких", "какую", "какого", "для"}
+    structural_block = len(token_set) >= 4 and bool(structural_tokens & token_set)
     lang_phrases = FOLLOWUP_PHRASES.get(lang, set()) | FOLLOWUP_PHRASES.get("default", set())
     for phrase in lang_phrases:
-        if phrase and phrase in normalized_query:
+        if phrase and phrase in normalized_query and not structural_block:
             return True
-    token_set = set(tokens)
+    if structural_block:
+        return False
     if not token_set:
         return False
     keywords = FOLLOWUP_KEYWORDS.get(lang, set()) | FOLLOWUP_KEYWORDS.get("default", set())
@@ -2090,6 +2094,12 @@ def search_products(
     keywords = INTENT_KEYWORDS.get(lang, set()) | INTENT_KEYWORDS.get("default", set())
     force_listing = bool(keyword_candidates & keywords)
 
+    requested_areas = {
+        token
+        for token in normalized_simple_tokens
+        if token in {"лицо", "губы", "волосы", "кожа", "глаза"}
+    }
+
     index_map: dict[int, int] = {}
     category_map: dict[str, str] = {}
     category_tokens_map: dict[str, set[str]] = {}
@@ -2191,11 +2201,6 @@ def search_products(
 
     matches_before_category = matches[:]
 
-    if not force_listing:
-        area_tokens = {token for token in normalized_simple_tokens if token in CATEGORY_TOKEN_ALIASES.values()}
-        if area_tokens:
-            force_listing = True
-
     mentioned_categories: set[str] = set()
     for alias_norm, original_name in category_map.items():
         if not alias_norm:
@@ -2214,6 +2219,8 @@ def search_products(
         if parts and any(_normalize_category_token(part) in normalized_simple_tokens for part in parts):
             mentioned_categories.add(original_name)
 
+    mentioned_categories.update(requested_areas)
+
     mentioned_aliases = {name.lower().replace("ё", "е") for name in mentioned_categories}
     if mentioned_aliases:
         filtered_matches = []
@@ -2225,6 +2232,8 @@ def search_products(
         if filtered_matches:
             matches = filtered_matches
         elif matches_before_category:
+            if requested_areas:
+                return [], [], price_limit, [], sorted(mentioned_categories)
             matches = matches_before_category
             mentioned_categories = set()
             mentioned_aliases = set()
@@ -2234,6 +2243,8 @@ def search_products(
             mentioned_aliases = set()
 
     if not matches:
+        if requested_areas:
+            return [], [], price_limit, [], sorted(mentioned_categories) if mentioned_categories else []
         if products:
             matches = [(1, product) for product in products]
             mentioned_categories = set()
