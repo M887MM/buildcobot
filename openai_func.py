@@ -40,9 +40,12 @@ class ProductLike(Protocol):
 DEFAULT_GPT_MODEL = "gpt-5-chat-latest"
 CLAUDE_MODEL = "claude-3-5-haiku-latest"
 PLACEHOLDER_PHOTO = "https://via.placeholder.com/600x400.png?text=No+Image"
+CATEGORY_MATCH_BOOST = 2
+LLM_PROVIDER_ORDER_ENV = os.getenv("LLM_PROVIDER_ORDER")
 
+ANTHROPIC_ENABLED = os.getenv("ANTHROPIC_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 _claude_client = None
-_claude_key = os.getenv("ANTHROPIC_API_KEY")
+_claude_key = os.getenv("ANTHROPIC_API_KEY") if ANTHROPIC_ENABLED else None
 if _claude_key and Anthropic:
     try:
         _claude_client = Anthropic(api_key=_claude_key)
@@ -81,7 +84,14 @@ def _parse_provider_order(env_value: Optional[str]) -> List[str]:
     return order
 
 
-LLM_PROVIDER_SEQUENCE = _parse_provider_order(os.getenv("LLM_PROVIDER_ORDER"))
+if not _claude_key or _claude_client is None:
+    LLM_PROVIDER_SEQUENCE = [
+        provider for provider in _parse_provider_order(LLM_PROVIDER_ORDER_ENV)
+        if provider != "anthropic"
+    ]
+else:
+    LLM_PROVIDER_SEQUENCE = _parse_provider_order(LLM_PROVIDER_ORDER_ENV)
+
 PROVIDER_LABELS = {"openai": "gpt", "anthropic": "claude"}
 
 # === Кэши ===
@@ -429,8 +439,6 @@ PRODUCT_CACHE = {"items": None, "loaded_at": 0.0}
 user_product_sessions: dict[int, dict] = {}
 user_short_memory: defaultdict[int, dict] = defaultdict(dict)
 USER_MEMORY_HISTORY_SIZE = 5
-CATEGORY_MATCH_BONUS = 2
-
 CATEGORY_TOKEN_ALIASES = {
     "лицо": "лицо",
     "лица": "лицо",
@@ -2100,12 +2108,14 @@ def search_products(
         for token in normalized_simple_tokens
         if token in {"лицо", "губы", "волосы", "кожа", "глаза"}
     }
+    missing_category_candidates: set[str] = set()
 
     index_map: dict[int, int] = {}
     category_map: dict[str, str] = {}
     category_tokens_map: dict[str, set[str]] = {}
     product_text_cache: dict[int, str] = {}
     product_name_cache: dict[int, str] = {}
+    product_token_cache: dict[int, set[str]] = {}
     for idx, product in enumerate(products, start=1):
         product_id = getattr(product, "id", None)
         if product_id is not None:
@@ -2140,7 +2150,8 @@ def search_products(
         product_key = getattr(product, "id", None) or id(product)
         base_fields = product_text_cache.get(product_key)
         normalized_name = product_name_cache.get(product_key)
-        if base_fields is None or normalized_name is None:
+        tokens_for_product = product_token_cache.get(product_key)
+        if base_fields is None or normalized_name is None or tokens_for_product is None:
             normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
             normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
             normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
@@ -2150,6 +2161,13 @@ def search_products(
             )
             product_text_cache[product_key] = base_fields
             product_name_cache[product_key] = normalized_name
+            tokens_for_product = {
+                _normalize_category_token(token)
+                for token in _tokenize_simple(base_fields)
+            }
+            product_token_cache[product_key] = tokens_for_product
+        else:
+            tokens_for_product = product_token_cache[product_key]
         if profile_skin and skin_keyword_set:
             if any(keyword in base_fields for keyword in skin_keyword_set):
                 score += 3
@@ -2204,22 +2222,13 @@ def search_products(
         area_filtered: List[Tuple[int, ProductLike]] = []
         for score, product in matches:
             product_key = getattr(product, "id", None) or id(product)
-            base_fields = product_text_cache.get(product_key)
-            if base_fields is None:
-                normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
-                normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
-                normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
-                normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
-                base_fields = " ".join(
-                    filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
-                )
-                product_text_cache[product_key] = base_fields
-                product_name_cache.setdefault(product_key, normalized_name)
-            if any(area in base_fields for area in requested_areas):
+            tokens_for_product = product_token_cache.get(product_key) or set()
+            if tokens_for_product & requested_areas:
                 area_filtered.append((score, product))
-        matches = area_filtered
-
-    matches_before_category = matches[:]
+        if area_filtered:
+            matches = area_filtered
+        else:
+            missing_category_candidates.update(requested_areas)
 
     mentioned_categories: set[str] = set()
     for alias_norm, original_name in category_map.items():
@@ -2242,39 +2251,29 @@ def search_products(
     if requested_areas:
         mentioned_categories.update(requested_areas)
 
-    mentioned_aliases = {name.lower().replace("ё", "е") for name in mentioned_categories}
-    original_requested_categories = sorted(mentioned_categories) if mentioned_categories else []
-    if mentioned_aliases:
-        filtered_matches = []
+    category_filtered: List[Tuple[int, ProductLike]] = []
+    if mentioned_categories:
+        mentioned_aliases = {
+            (normalize_text(name) or name).lower().replace("ё", "е")
+            for name in mentioned_categories
+        }
         for score, product in matches:
             product_category = normalize_text(getattr(product, "category", "") or "") or ""
             product_alias = product_category.lower().replace("ё", "е")
             if product_alias in mentioned_aliases:
-                filtered_matches.append((score + CATEGORY_MATCH_BONUS, product))
-        if filtered_matches:
-            matches = filtered_matches
-        elif matches_before_category:
-            if requested_areas:
-                return [], [], price_limit, [], original_requested_categories or []
-            matches = matches_before_category
-            mentioned_categories = set()
-            mentioned_aliases = set()
+                category_filtered.append((score + CATEGORY_MATCH_BOOST, product))
+        if category_filtered:
+            matches = category_filtered
         else:
-            if requested_areas:
-                return [], [], price_limit, [], original_requested_categories or []
-            matches = [(1, product) for product in products]
-            mentioned_categories = set()
-            mentioned_aliases = set()
+            missing_category_candidates.update(mentioned_categories)
+
+    missing_hint = sorted(missing_category_candidates) or sorted(mentioned_categories) or sorted(requested_areas)
 
     if not matches:
-        if requested_areas:
-            return [], [], price_limit, [], original_requested_categories or []
-        if products:
+        if force_listing and products:
             matches = [(1, product) for product in products]
-            mentioned_categories = set()
-            force_listing = True
         else:
-            return [], [], price_limit, [], sorted(mentioned_categories)
+            return [], [], price_limit, [], missing_hint
 
     def sort_key(pair: Tuple[int, ProductLike]):
         score, product = pair
@@ -2298,7 +2297,7 @@ def search_products(
     payload = [_serialize_product(product, lang, index_map) for product in first_page_products]
     full_payload = [_serialize_product(product, lang, index_map) for product in ordered]
 
-    return payload, first_page_products, price_limit, full_payload, sorted(mentioned_categories)
+    return payload, first_page_products, price_limit, full_payload, []
 
 
 def _reset_product_session(user_id: int):
