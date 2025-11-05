@@ -490,6 +490,20 @@ CATEGORY_TOKEN_ALIASES = {
     "губная": "губы",
     "губного": "губы",
     "lip": "губы",
+    "помада": "губы",
+    "помады": "губы",
+    "помадой": "губы",
+    "помад": "губы",
+    "помаде": "губы",
+    "помаду": "губы",
+    "бальзам": "губы",
+    "бальзамы": "губы",
+    "бальзама": "губы",
+    "бальзамом": "губы",
+    "balm": "губы",
+    "tint": "губы",
+    "lipstick": "губы",
+    "lipgloss": "губы",
 }
 
 RECOMMENDATION_LANGUAGE_HINTS = {
@@ -1311,16 +1325,37 @@ def _tokenize_simple(text: str) -> List[str]:
 
 def _expand_token_set(tokens: Iterable[str]) -> set[str]:
     expanded: set[str] = set()
+    queue: List[str] = []
+    seen: set[str] = set()
     for token in tokens:
-        if not token:
+        if token:
+            queue.append(token.replace("ё", "е"))
+
+    while queue:
+        raw = queue.pop()
+        if not raw:
             continue
-        normalized = _normalize_category_token(token.replace("ё", "е"))
+        if raw in seen:
+            continue
+        seen.add(raw)
+        normalized = _normalize_category_token(raw)
         if len(normalized) > 2:
             expanded.add(normalized)
-        for variant in _token_variants(token):
-            variant_norm = _normalize_category_token(variant.replace("ё", "е"))
-            if len(variant_norm) > 2:
-                expanded.add(variant_norm)
+        for variant in _token_variants(raw):
+            if variant and variant not in seen:
+                queue.append(variant)
+        for prefix, synonyms in SYNONYM_PREFIXES.items():
+            if normalized.startswith(prefix):
+                for synonym in synonyms:
+                    normalized_syn = synonym.replace("ё", "е")
+                    if normalized_syn not in seen:
+                        queue.append(normalized_syn)
+        exact_synonyms = SYNONYM_EXACT.get(normalized)
+        if exact_synonyms:
+            for synonym in exact_synonyms:
+                normalized_syn = synonym.replace("ё", "е")
+                if normalized_syn not in seen:
+                    queue.append(normalized_syn)
     return expanded
 
 
