@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from typing import List, Optional, Tuple, Protocol
 from types import SimpleNamespace
+from difflib import SequenceMatcher
 
 from aiogram import Bot, types
 from dotenv import load_dotenv
@@ -1291,6 +1292,21 @@ def _tokenize_simple(text: str) -> List[str]:
     return [token.replace("ё", "е") for token in re.findall(r"[a-zа-я0-9]+", text.lower()) if token]
 
 
+def _semantic_similarity_score(query: str, text: str) -> float:
+    if not query or not text:
+        return 0.0
+    query_norm = query.lower()
+    text_norm = text.lower()
+    ratio = SequenceMatcher(None, query_norm, text_norm).ratio()
+    query_tokens = set(_tokenize_simple(query_norm))
+    if not query_tokens:
+        return ratio
+    text_tokens = set(_tokenize_simple(text_norm))
+    overlap = len(query_tokens & text_tokens)
+    coverage = overlap / len(query_tokens)
+    return (ratio * 0.6) + (coverage * 0.4)
+
+
 def _is_show_more_request(text: str, lang: str) -> bool:
     base = _normalize_query(text)
     phrases = SHOW_MORE_PHRASES.get(lang, set()) | SHOW_MORE_PHRASES.get("default", set())
@@ -2218,6 +2234,27 @@ def search_products(
         if fallback_matches:
             matches = fallback_matches
 
+    if matches:
+        query_semantic = _normalize_query(query)
+        boosted_matches: List[Tuple[int, ProductLike]] = []
+        for score, product in matches:
+            product_key = getattr(product, "id", None) or id(product)
+            base_fields = product_text_cache.get(product_key)
+            if base_fields is None:
+                normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+                normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
+                normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
+                base_fields = " ".join(
+                    filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
+                )
+                product_text_cache[product_key] = base_fields
+                product_name_cache.setdefault(product_key, normalized_name)
+            semantic_score = _semantic_similarity_score(query_semantic, base_fields)
+            boosted_score = score + int(round(semantic_score * 10))
+            boosted_matches.append((boosted_score, product))
+        matches = boosted_matches
+
     if requested_areas and matches:
         area_filtered: List[Tuple[int, ProductLike]] = []
         for score, product in matches:
@@ -2297,7 +2334,8 @@ def search_products(
     payload = [_serialize_product(product, lang, index_map) for product in first_page_products]
     full_payload = [_serialize_product(product, lang, index_map) for product in ordered]
 
-    return payload, first_page_products, price_limit, full_payload, []
+    missing_hint = sorted(missing_category_candidates)
+    return payload, first_page_products, price_limit, full_payload, missing_hint
 
 
 def _reset_product_session(user_id: int):
