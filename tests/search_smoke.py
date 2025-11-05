@@ -193,6 +193,21 @@ def run_smoke() -> None:
                     f"Результат для «{query}» не содержит ожидаемый фрагмент «{expected_fragment}».\n{combined_text}"
                 )
 
+    # Проверяем отсутствие категорий: очищаем каталог от facial товаров.
+    no_face_catalog = [
+        item
+        for item in catalog
+        if "лицо" not in (item.tags or "") and "face" not in (item.tags or "")
+    ]
+    openai_func.invalidate_products_cache()
+    openai_func.load_active_products = lambda force=False: no_face_catalog  # type: ignore[assignment]
+
+    payload, matches, _, _, categories = openai_func.search_products("что у тебя есть для лица", "ru")
+    if payload or matches or not categories or "лицо" not in categories:
+        errors.append(
+            "Ожидалась пустая выдача для запроса «что у тебя есть для лица» без товаров для лица."
+        )
+
     if errors:
         raise SystemExit("\n".join(errors))
 

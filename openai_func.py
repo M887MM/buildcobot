@@ -39,6 +39,7 @@ class ProductLike(Protocol):
 
 DEFAULT_GPT_MODEL = "gpt-5-chat-latest"
 CLAUDE_MODEL = "claude-3-5-haiku-latest"
+PLACEHOLDER_PHOTO = "https://via.placeholder.com/600x400.png?text=No+Image"
 
 _claude_client = None
 _claude_key = os.getenv("ANTHROPIC_API_KEY")
@@ -1933,7 +1934,7 @@ def _serialize_product(product: ProductLike, lang: str, index_map: dict[int, int
         photo_raw = normalize_text(pictures[0]) or pictures[0]
         entry["photo"] = normalize_url(photo_raw)
     else:
-        entry["photo"] = None
+        entry["photo"] = PLACEHOLDER_PHOTO
     product_id = getattr(product, "id", None)
     entry["product_id"] = product_id if product_id is not None else id(product)
     if product_id is not None and product_id in index_map:
@@ -2199,6 +2200,25 @@ def search_products(
         if fallback_matches:
             matches = fallback_matches
 
+    if requested_areas and matches:
+        area_filtered: List[Tuple[int, ProductLike]] = []
+        for score, product in matches:
+            product_key = getattr(product, "id", None) or id(product)
+            base_fields = product_text_cache.get(product_key)
+            if base_fields is None:
+                normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+                normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
+                normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
+                base_fields = " ".join(
+                    filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
+                )
+                product_text_cache[product_key] = base_fields
+                product_name_cache.setdefault(product_key, normalized_name)
+            if any(area in base_fields for area in requested_areas):
+                area_filtered.append((score, product))
+        matches = area_filtered
+
     matches_before_category = matches[:]
 
     mentioned_categories: set[str] = set()
@@ -2219,9 +2239,11 @@ def search_products(
         if parts and any(_normalize_category_token(part) in normalized_simple_tokens for part in parts):
             mentioned_categories.add(original_name)
 
-    mentioned_categories.update(requested_areas)
+    if requested_areas:
+        mentioned_categories.update(requested_areas)
 
     mentioned_aliases = {name.lower().replace("ё", "е") for name in mentioned_categories}
+    original_requested_categories = sorted(mentioned_categories) if mentioned_categories else []
     if mentioned_aliases:
         filtered_matches = []
         for score, product in matches:
@@ -2233,18 +2255,20 @@ def search_products(
             matches = filtered_matches
         elif matches_before_category:
             if requested_areas:
-                return [], [], price_limit, [], sorted(mentioned_categories)
+                return [], [], price_limit, [], original_requested_categories or []
             matches = matches_before_category
             mentioned_categories = set()
             mentioned_aliases = set()
         else:
+            if requested_areas:
+                return [], [], price_limit, [], original_requested_categories or []
             matches = [(1, product) for product in products]
             mentioned_categories = set()
             mentioned_aliases = set()
 
     if not matches:
         if requested_areas:
-            return [], [], price_limit, [], sorted(mentioned_categories) if mentioned_categories else []
+            return [], [], price_limit, [], original_requested_categories or []
         if products:
             matches = [(1, product) for product in products]
             mentioned_categories = set()
