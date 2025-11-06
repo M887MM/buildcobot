@@ -437,6 +437,8 @@ SYNONYM_EXACT = {
     "бальзам": {"губы"},
     "lipstick": {"губы"},
     "lipbalm": {"губы"},
+    "губы": {"помада", "бальзам", "блеск", "тинт", "lip", "balm", "gloss"},
+    "тональный": {"foundation", "тональник", "bb", "cc", "кушон"},
 }
 
 PRODUCT_PAGE_SIZE = 4
@@ -504,6 +506,26 @@ CATEGORY_TOKEN_ALIASES = {
     "tint": "губы",
     "lipstick": "губы",
     "lipgloss": "губы",
+    "ногти": "ногти",
+    "ногтей": "ногти",
+    "ногтю": "ногти",
+    "ногтя": "ногти",
+    "ногте": "ногти",
+    "ногтям": "ногти",
+    "ногтями": "ногти",
+    "ногтях": "ногти",
+    "ногт": "ногти",
+    "маникюр": "ногти",
+    "маникюра": "ногти",
+    "маникюру": "ногти",
+    "маникюре": "ногти",
+    "маникюрный": "ногти",
+    "маникюрная": "ногти",
+    "маникюрные": "ногти",
+    "маникюрных": "ногти",
+    "nail": "ногти",
+    "nails": "ногти",
+    "cuticle": "ногти",
 }
 
 RECOMMENDATION_LANGUAGE_HINTS = {
@@ -1331,6 +1353,8 @@ def _expand_token_set(tokens: Iterable[str]) -> set[str]:
         if token:
             queue.append(token.replace("ё", "е"))
 
+    prefix_strips = ("для", "про", "под", "по")
+
     while queue:
         raw = queue.pop()
         if not raw:
@@ -1344,6 +1368,15 @@ def _expand_token_set(tokens: Iterable[str]) -> set[str]:
         for variant in _token_variants(raw):
             if variant and variant not in seen:
                 queue.append(variant)
+        for prefix in prefix_strips:
+            if raw.startswith(prefix) and len(raw) - len(prefix) >= 3:
+                stripped = raw[len(prefix):]
+                if stripped not in seen:
+                    queue.append(stripped)
+            if raw.startswith(prefix + "-") and len(raw) - len(prefix) - 1 >= 3:
+                stripped = raw[len(prefix) + 1 :]
+                if stripped not in seen:
+                    queue.append(stripped)
         for prefix, synonyms in SYNONYM_PREFIXES.items():
             if normalized.startswith(prefix):
                 for synonym in synonyms:
@@ -2189,7 +2222,7 @@ def search_products(
     requested_areas = {
         token
         for token in normalized_simple_tokens
-        if token in {"лицо", "губы", "волосы", "кожа", "глаза"}
+        if token in {"лицо", "губы", "волосы", "кожа", "глаза", "ногти"}
     }
     missing_category_candidates: set[str] = set()
     query_token_pool = _expand_token_set(tokens) | _expand_token_set(simple_tokens)
@@ -2388,6 +2421,43 @@ def search_products(
             matches = area_filtered
         else:
             missing_category_candidates.update(requested_areas)
+
+    if requested_areas and matches:
+        # Отдаём приоритет товарам, где нужная зона фигурирует в названии, тегах или категории.
+        area_variants: set[str] = set()
+        for token in requested_areas:
+            area_variants.add(token)
+            area_variants.update(_expand_token_set([token]))
+
+        strong_matches: List[Tuple[int, ProductLike]] = []
+        fallback_matches: List[Tuple[int, ProductLike]] = []
+        for score, product in matches:
+            product_key = getattr(product, "id", None) or id(product)
+            name_text = product_name_cache.get(product_key)
+            if name_text is None:
+                name_text = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                product_name_cache[product_key] = name_text
+            category_text = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+            tags_text = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
+
+            field_values = [name_text, category_text, tags_text]
+            strong = False
+            for variant in area_variants:
+                if not variant:
+                    continue
+                if any(field and _token_matches(variant, field) for field in field_values):
+                    strong = True
+                    break
+
+            if strong:
+                strong_matches.append((score, product))
+            else:
+                fallback_matches.append((score, product))
+
+        if strong_matches:
+            matches = strong_matches
+        elif fallback_matches:
+            matches = fallback_matches
 
     mentioned_categories: set[str] = set()
     for alias_norm, original_name in category_map.items():
