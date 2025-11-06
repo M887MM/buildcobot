@@ -526,7 +526,93 @@ CATEGORY_TOKEN_ALIASES = {
     "nail": "ногти",
     "nails": "ногти",
     "cuticle": "ногти",
+    "нокти": "ногти",
+    "ноктей": "ногти",
+    "ноктю": "ногти",
+    "ноктя": "ногти",
+    "нокте": "ногти",
+    "ноктям": "ногти",
+    "ноктями": "ногти",
+    "ноктях": "ногти",
+    "нокт": "ногти",
+    "лак": "ногти",
+    "лаки": "ногти",
+    "лаком": "ногти",
+    "лаке": "ногти",
+    "лаков": "ногти",
+    "гельлак": "ногти",
+    "гель-лак": "ногти",
+    "шеллак": "ногти",
+    "накладные": "ногти",
+    "накладной": "ногти",
+    "накладных": "ногти",
+    "накладка": "ногти",
+    "накладку": "ногти",
 }
+
+AREA_KEYWORD_TABLE = {
+    "лицо": {"крем", "сыворот", "маска", "тонер", "очищен"},
+    "губы": {"помада", "бальзам", "тинт", "блеск", "lip", "gloss"},
+    "волосы": {"шампун", "бальзам", "кондиционер", "маска", "oil"},
+    "кожа": {"лосьон", "крем", "масло", "body"},
+    "глаза": {"тушь", "подводка", "лайнер", "тени", "mascara"},
+    "ногти": {"ногти", "лак", "гельлак", "гель-лак", "маникюр", "топ", "база"},
+}
+
+CATEGORY_SPELLCHECK_KEYS: tuple[str, ...] = tuple(
+    sorted({token for token in CATEGORY_TOKEN_ALIASES if len(token) >= 3})
+)
+_MAX_CATEGORY_SPELLCHECK_DISTANCE = 2
+
+
+def _bounded_levenshtein(left: str, right: str, max_distance: int) -> Optional[int]:
+    if left == right:
+        return 0
+    if not left:
+        return len(right) if len(right) <= max_distance else None
+    if not right:
+        return len(left) if len(left) <= max_distance else None
+    if abs(len(left) - len(right)) > max_distance:
+        return None
+
+    previous = list(range(len(right) + 1))
+    for i, l_ch in enumerate(left, 1):
+        current = [i]
+        row_min = current[0]
+        for j, r_ch in enumerate(right, 1):
+            cost = 0 if l_ch == r_ch else 1
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + cost
+            best = min(insert_cost, delete_cost, replace_cost)
+            current.append(best)
+            if best < row_min:
+                row_min = best
+        if row_min > max_distance:
+            return None
+        previous = current
+    distance = previous[-1]
+    return distance if distance <= max_distance else None
+
+
+def _spellcheck_category_token(token: str) -> Optional[str]:
+    if len(token) < 3:
+        return None
+    first_char = token[0]
+    best_candidate: Optional[str] = None
+    best_distance = _MAX_CATEGORY_SPELLCHECK_DISTANCE + 1
+    for candidate in CATEGORY_SPELLCHECK_KEYS:
+        if candidate[0] != first_char:
+            continue
+        distance = _bounded_levenshtein(token, candidate, _MAX_CATEGORY_SPELLCHECK_DISTANCE)
+        if distance is None:
+            continue
+        if distance < best_distance:
+            best_candidate = candidate
+            best_distance = distance
+            if best_distance == 1:
+                break
+    return best_candidate
 
 RECOMMENDATION_LANGUAGE_HINTS = {
     "ru": "Отвечай на русском языке.",
@@ -1334,7 +1420,13 @@ def _combine_blocks(*parts: Optional[str]) -> str:
 
 def _normalize_category_token(token: str) -> str:
     base = token.lower().replace("ё", "е")
-    return CATEGORY_TOKEN_ALIASES.get(base, base)
+    alias = CATEGORY_TOKEN_ALIASES.get(base)
+    if alias:
+        return alias
+    corrected = _spellcheck_category_token(base)
+    if corrected:
+        return CATEGORY_TOKEN_ALIASES.get(corrected, corrected)
+    return base
 
 
 def _normalize_query(text: str) -> str:
@@ -2224,6 +2316,7 @@ def search_products(
         for token in normalized_simple_tokens
         if token in {"лицо", "губы", "волосы", "кожа", "глаза", "ногти"}
     }
+    area_synonym_tokens: set[str] = set()
     missing_category_candidates: set[str] = set()
     query_token_pool = _expand_token_set(tokens) | _expand_token_set(simple_tokens)
     if not query_token_pool and normalized_simple_tokens:
@@ -2301,6 +2394,44 @@ def search_products(
                 score += 3
         if score > 0:
             matches.append((score, product))
+
+    if not matches and requested_areas:
+        for area_token in requested_areas:
+            anchors = AREA_KEYWORD_TABLE.get(area_token)
+            if not anchors:
+                continue
+            area_synonym_tokens.update(_expand_token_set(list(anchors)))
+        if area_synonym_tokens:
+            for product in products:
+                product_key = getattr(product, "id", None) or id(product)
+                tokens_for_product = product_token_cache.get(product_key)
+                base_fields = product_text_cache.get(product_key)
+                if tokens_for_product is None:
+                    if base_fields is None:
+                        normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                        normalized_category = (normalize_text(getattr(product, "category", "") or "") or "").lower()
+                        normalized_description = (normalize_text(getattr(product, "description", "") or "") or "").lower()
+                        normalized_tags = (normalize_text(getattr(product, "tags", "") or "") or "").lower()
+                        base_fields = " ".join(
+                            filter(None, [normalized_name, normalized_category, normalized_description, normalized_tags])
+                        )
+                        product_text_cache[product_key] = base_fields
+                        product_name_cache.setdefault(product_key, normalized_name)
+                    else:
+                        normalized_name = product_name_cache.get(product_key)
+                        if normalized_name is None:
+                            normalized_name = (normalize_text(getattr(product, "name", "") or "") or "").lower()
+                            product_name_cache[product_key] = normalized_name
+                    tokens_for_product = _expand_token_set(_tokenize_simple(base_fields or ""))
+                    product_token_cache[product_key] = tokens_for_product
+                if not tokens_for_product:
+                    continue
+                match_tokens = tokens_for_product & area_synonym_tokens
+                if not match_tokens:
+                    continue
+                base_score = max(len(match_tokens), 1)
+                matches.append((base_score + 1, product))
+                product_match_stat[product_key] = (len(match_tokens), 0)
 
     if not matches and price_limit:
         for product in products:
@@ -2412,10 +2543,13 @@ def search_products(
 
     if requested_areas and matches:
         area_filtered: List[Tuple[int, ProductLike]] = []
+        filter_tokens = set(requested_areas)
+        if area_synonym_tokens:
+            filter_tokens.update(area_synonym_tokens)
         for score, product in matches:
             product_key = getattr(product, "id", None) or id(product)
             tokens_for_product = product_token_cache.get(product_key) or set()
-            if tokens_for_product & requested_areas:
+            if tokens_for_product & filter_tokens:
                 area_filtered.append((score, product))
         if area_filtered:
             matches = area_filtered
@@ -2428,6 +2562,9 @@ def search_products(
         for token in requested_areas:
             area_variants.add(token)
             area_variants.update(_expand_token_set([token]))
+            anchors = AREA_KEYWORD_TABLE.get(token)
+            if anchors:
+                area_variants.update(_expand_token_set(list(anchors)))
 
         strong_matches: List[Tuple[int, ProductLike]] = []
         fallback_matches: List[Tuple[int, ProductLike]] = []
