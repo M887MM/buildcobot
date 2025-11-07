@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import time
 import os
@@ -7,6 +8,11 @@ from collections import defaultdict
 from typing import Iterable, List, Optional, Tuple, Protocol
 from types import SimpleNamespace
 from difflib import SequenceMatcher
+
+try:
+    import httpx
+except ImportError:  # pragma: no cover - optional dependency
+    httpx = None
 
 from aiogram import Bot, types
 from dotenv import load_dotenv
@@ -385,6 +391,46 @@ SHOW_MORE_TOKENS = {
     "en": {"more", "next"},
     "kk": {"тағы", "көбірек", "одан әрі"},
     "default": {"more"},
+}
+USAGE_PHRASES = {
+    "ru": {
+        "как использовать",
+        "как применять",
+        "способ применения",
+        "инструкция по применению",
+        "как наносить",
+    },
+    "uz": {
+        "qanday ishlatish",
+        "qanday qo'llash",
+        "foydalanish tartibi",
+    },
+    "en": {
+        "how to use",
+        "how do i use",
+        "usage instructions",
+        "application method",
+    },
+    "kk": {
+        "қалай қолдану",
+        "қолдану тәсілі",
+        "пайдалану тәртібі",
+    },
+    "default": {"how to apply", "usage"},
+}
+USAGE_TOKENS = {
+    "ru": {"использовать", "применять", "нанести", "наносить", "инструкция", "применение"},
+    "uz": {"ishlatish", "qo'llash", "foydalanish", "instruksiya"},
+    "en": {"use", "apply", "application", "instructions", "usage"},
+    "kk": {"қолдану", "пайдалану", "жағу", "нұсқаулық"},
+    "default": {"usage", "apply"},
+}
+USAGE_SEARCH_HINTS = {
+    "ru": "инструкция по применению",
+    "uz": "qanday ishlatish",
+    "en": "how to use",
+    "kk": "қалай қолдану",
+    "default": "how to use",
 }
 CONTINUATION_TEMPLATES = {
     "ru": "Продолжаю подбор: показано {shown} из {total}, добавляю ещё {new}.",
@@ -1864,6 +1910,22 @@ def _is_health_query(text: str, lang: str) -> bool:
     return False
 
 
+def _is_usage_question(text: str, lang: str) -> bool:
+    normalized = _normalize_query(text)
+    if not normalized:
+        return False
+    phrase_pool = USAGE_PHRASES.get(lang, set()) | USAGE_PHRASES.get("default", set())
+    for phrase in phrase_pool:
+        if phrase and phrase in normalized:
+            return True
+
+    tokens = set(_tokenize_simple(text))
+    if not tokens:
+        return False
+    keyword_pool = USAGE_TOKENS.get(lang, set()) | USAGE_TOKENS.get("default", set())
+    return bool(tokens & keyword_pool)
+
+
 def _build_health_response(text: str, lang: str) -> str:
     language_hint = RECOMMENDATION_LANGUAGE_HINTS.get(lang, RECOMMENDATION_LANGUAGE_HINTS["ru"])
     tone_hint = RECOMMENDATION_TONE_HINTS.get(lang, RECOMMENDATION_TONE_HINTS["ru"])
@@ -2378,6 +2440,25 @@ def format_product_text(product: ProductLike, lang: str) -> str:
     return "\n".join(parts)
 
 
+USAGE_TITLE_LINES = {
+    "ru": "🧴 Инструкция по применению",
+    "uz": "🧴 Qanday qo'llash",
+    "en": "🧴 How to apply",
+    "kk": "🧴 Қолдану тәртібі",
+}
+USAGE_SOURCE_LINES = {
+    "ru": "Источник: {source}",
+    "uz": "Manba: {source}",
+    "en": "Source: {source}",
+    "kk": "Дереккөз: {source}",
+}
+USAGE_DISCLAIMER_LINES = {
+    "ru": "⚠️ Перед применением сделайте патч-тест и следуйте инструкции производителя.",
+    "uz": "⚠️ Ishlatishdan oldin patч-test o'tkazing va ishlab chiqaruvchi ko'rsatmalariga amal qiling.",
+    "en": "⚠️ Patch-test first and follow the official instructions.",
+    "kk": "⚠️ Қолданар алдында патч-тест жасап, өндіруші нұсқаулығын ұстаныңыз.",
+}
+
 PRICE_FALLBACK_LINES = {
     "ru": "Условия обсуждаем индивидуально.",
     "en": "We'll go over the final terms individually.",
@@ -2433,6 +2514,110 @@ def _sanitize_price_mentions(text: str, lang: str) -> str:
     if removed_any and fallback and fallback not in cleaned_text:
         return f"{cleaned_text}\n{fallback}"
     return cleaned_text
+
+
+async def fetch_usage_guidance(query: str, lang: str) -> Optional[str]:
+    snippet = await _fetch_usage_snippet_from_web(query, lang)
+    if not snippet:
+        return None
+    sanitized_text = _sanitize_price_mentions(snippet["text"], lang)
+    return _format_usage_message(
+        sanitized_text,
+        snippet.get("source"),
+        snippet.get("url"),
+        lang,
+    )
+
+
+def _format_usage_message(text: str, source: Optional[str], url: Optional[str], lang: str) -> str:
+    title = USAGE_TITLE_LINES.get(lang, USAGE_TITLE_LINES["ru"])
+    disclaimer = USAGE_DISCLAIMER_LINES.get(lang, USAGE_DISCLAIMER_LINES["ru"])
+    source_template = USAGE_SOURCE_LINES.get(lang, USAGE_SOURCE_LINES["ru"])
+
+    parts: List[str] = [title, text]
+
+    if source or url:
+        display = source or url or ""
+        if url and source:
+            display = f"{source} — {url}"
+        elif url and not source:
+            display = url
+        source_line = source_template.format(source=display)
+        parts.append(source_line)
+
+    if disclaimer:
+        parts.append(disclaimer)
+
+    return "\n\n".join(part for part in parts if part)
+
+
+async def _fetch_usage_snippet_from_web(query: str, lang: str) -> Optional[dict]:
+    if httpx is None:
+        logger.warning("httpx не установлен, пропускаем веб-поиск инструкций.")
+        return None
+
+    suffix = USAGE_SEARCH_HINTS.get(lang, USAGE_SEARCH_HINTS["default"])
+    search_query = " ".join(token for token in (query, suffix) if token).strip()
+    params = {
+        "q": search_query,
+        "format": "json",
+        "no_redirect": "1",
+        "no_html": "1",
+        "skip_disambig": "1",
+    }
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "LuxeBeautyBot/1.0 (+https://t.me/)",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0)) as client:
+            response = await client.get("https://api.duckduckgo.com/", params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as error:
+        logger.warning("Не удалось получить инструкцию из DuckDuckGo: %s", error)
+        return None
+
+    text = _clean_usage_text(data.get("AbstractText") or data.get("Abstract"))
+    source = data.get("AbstractSource") or data.get("Heading")
+    url = data.get("AbstractURL")
+
+    if not text:
+        text, related_url = _extract_related_topic_snippet(data.get("RelatedTopics"))
+        if text:
+            url = url or related_url
+
+    if not text:
+        return None
+
+    return {"text": text, "source": source, "url": url}
+
+
+def _extract_related_topic_snippet(related_topics) -> Tuple[Optional[str], Optional[str]]:
+    if not related_topics:
+        return None, None
+    for item in related_topics:
+        if not isinstance(item, dict):
+            continue
+        if "Text" in item:
+            text = _clean_usage_text(item.get("Text"))
+            if text:
+                return text, item.get("FirstURL")
+        nested = item.get("Topics")
+        if nested:
+            text, url = _extract_related_topic_snippet(nested)
+            if text:
+                return text, url
+    return None, None
+
+
+def _clean_usage_text(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    decoded = html.unescape(value)
+    cleaned = normalize_text(decoded) or decoded
+    cleaned = cleaned.strip()
+    return cleaned or None
 
 
 def build_summary_text(
@@ -3217,6 +3402,10 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     profile_hint_text = _format_profile_hint(user_profile, lang) if user_profile else None
     normalized_query = _normalize_query(text)
     simple_tokens = _tokenize_simple(text)
+    usage_requested = _is_usage_question(text, lang)
+    usage_response_text: Optional[str] = None
+    if usage_requested:
+        usage_response_text = await fetch_usage_guidance(text, lang)
 
     if _is_availability_followup(normalized_query, simple_tokens, lang):
         followup_payload = _handle_availability_followup(user_id, lang)
@@ -3243,6 +3432,39 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
             "text": message,
             "products": [],
             "meta": {"continuation": False, "display_text": True},
+        }
+
+    if usage_response_text:
+        products_payload, matched_products, price_limit, full_payload, mentioned_categories = search_products(
+            text,
+            lang,
+            user_profile=user_profile,
+        )
+        text_blocks: List[str] = [usage_response_text]
+        meta = {"display_text": True, "continuation": False, "usage": True}
+        if profile_hint_text:
+            text_blocks.append(profile_hint_text)
+        if health_guidance:
+            text_blocks.append(health_guidance)
+            meta["health"] = True
+
+        if products_payload:
+            _store_product_session(user_id, text, lang, full_payload, price_limit, user_profile)
+            _remember_user_topic(user_id, lang, text)
+            summary = build_summary_text(matched_products, lang, price_limit, total_count=len(full_payload))
+            if summary:
+                text_blocks.append(summary)
+            meta.update({"page": 1, "total": len(full_payload)})
+        elif mentioned_categories:
+            unavailable_text = _build_category_unavailable_message(mentioned_categories, lang)
+            text_blocks.append(unavailable_text)
+            meta["category_unavailable"] = True
+
+        combined_text = _combine_blocks(*text_blocks) or usage_response_text
+        return {
+            "text": combined_text,
+            "products": products_payload,
+            "meta": meta,
         }
 
     intent = _classify_intent(text, lang)
