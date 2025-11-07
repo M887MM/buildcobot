@@ -44,6 +44,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+
+def _get_manager_message_delay() -> int:
+    raw = os.getenv("MANAGER_MESSAGE_DELAY", "900")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logging.warning("Некорректное значение MANAGER_MESSAGE_DELAY='%s', используем 900 секунд.", raw)
+        return 900
+    return max(0, value)
+
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -58,6 +69,8 @@ WELCOME_MESSAGE = (
     "💄 Добро пожаловать в LuxeBeauty!\n\n"
     "Чем помочь сегодня? Подберите уход, макияж, подарки или узнайте о доставке."
 )
+
+MANAGER_MESSAGE_DELAY = _get_manager_message_delay()
 
 GOODS_OVERVIEW_TEXT = (
     "🛍️ Направления бутика LuxeBeauty:\n"
@@ -143,6 +156,9 @@ class OrderState(StatesGroup):
 # ====== Хранилища в памяти ======
 user_selection = {}         # per user: product, phone, username, name, quantity, comment, ...
 manager_message_ids = {}
+manager_message_texts = {}
+manager_pending_texts = {}
+manager_message_tasks = {}
 
 # ====== Кнопки и клавиатуры ======
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -267,6 +283,14 @@ def _apply_group_migration(new_chat_id: int):
     GROUP_ID = new_chat_id
     os.environ["GROUP_ID"] = str(new_chat_id)
     manager_message_ids.clear()
+    manager_message_texts.clear()
+    manager_pending_texts.clear()
+    for task in manager_message_tasks.values():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    manager_message_tasks.clear()
 
 
 async def _send_html_to_group(text: str) -> Optional[Message]:
@@ -291,29 +315,100 @@ async def _send_html_to_group(text: str) -> Optional[Message]:
         return None
 
 
-# ====== Менеджерское сообщение ======
-async def send_or_update_manager_message(user_id: int):
+async def _deliver_manager_message(user_id: int, text: str):
     if not GROUP_ID:
+        logging.debug("GROUP_ID не задан — пропускаем отправку менеджерского сообщения.")
+        manager_pending_texts.pop(user_id, None)
         return
-    text = build_manager_message(user_id)
+    existing_text = manager_message_texts.get(user_id)
     mid = manager_message_ids.get(user_id)
+    if mid and existing_text == text:
+        logging.debug("Менеджерское сообщение для %s уже соответствует текущему тексту.", user_id)
+        manager_pending_texts.pop(user_id, None)
+        return
+
     if mid:
         try:
             await bot.edit_message_text(chat_id=GROUP_ID, message_id=mid, text=text, parse_mode=ParseMode.HTML)
+            manager_message_texts[user_id] = text
+            manager_pending_texts.pop(user_id, None)
             return
         except TelegramMigrateToChat as migrate_exc:
             new_chat_id = _extract_migrated_chat_id(migrate_exc)
             if new_chat_id is not None:
                 _apply_group_migration(new_chat_id)
             manager_message_ids.pop(user_id, None)
-        except Exception:
-            logging.exception("Не удалось обновить менеджерское сообщение, отправляю новое.")
+            manager_message_texts.pop(user_id, None)
+        except exceptions.TelegramBadRequest as bad_req:
+            message_text = (getattr(bad_req, "message", None) or str(bad_req) or "").lower()
+            if "message is not modified" in message_text:
+                logging.info("Менеджерское сообщение для %s уже актуально — правка не требуется.", user_id)
+                manager_message_texts[user_id] = text
+                manager_pending_texts.pop(user_id, None)
+                return
+            logging.exception("Не удалось обновить менеджерское сообщение, отправляем новое.")
             manager_message_ids.pop(user_id, None)
+            manager_message_texts.pop(user_id, None)
+        except Exception:
+            logging.exception("Не удалось обновить менеджерское сообщение, отправляем новое.")
+            manager_message_ids.pop(user_id, None)
+            manager_message_texts.pop(user_id, None)
+
     message = await _send_html_to_group(text)
     if message:
         manager_message_ids[user_id] = message.message_id
+        manager_message_texts[user_id] = text
+        manager_pending_texts.pop(user_id, None)
     else:
         logging.error("Не удалось отправить менеджерское сообщение.")
+
+
+async def _delayed_manager_message_send(user_id: int, delay_seconds: int):
+    try:
+        logging.debug("Ждём %s сек перед отправкой менеджерского сообщения для %s.", delay_seconds, user_id)
+        await asyncio.sleep(delay_seconds)
+        text = manager_pending_texts.get(user_id)
+        if not text:
+            logging.debug("Нет отложенного текста для пользователя %s — отправка отменена.", user_id)
+            return
+        await _deliver_manager_message(user_id, text)
+    except asyncio.CancelledError:
+        logging.debug("Отложенная отправка менеджерского сообщения для %s отменена.", user_id)
+        return
+    except Exception:
+        logging.exception("Ошибка при отложенной отправке менеджерского сообщения.")
+    finally:
+        manager_message_tasks.pop(user_id, None)
+
+
+# ====== Менеджерское сообщение ======
+async def send_or_update_manager_message(user_id: int):
+    if not GROUP_ID:
+        return
+    text = build_manager_message(user_id)
+    if manager_message_texts.get(user_id) == text and user_id not in manager_message_tasks:
+        logging.debug("Менеджерское сообщение для %s уже актуально и не запланировано к обновлению.", user_id)
+        return
+
+    pending_text = manager_pending_texts.get(user_id)
+    existing_task = manager_message_tasks.get(user_id)
+    if existing_task and not existing_task.done():
+        if pending_text == text:
+            logging.debug("Уже запланирована отправка идентичного менеджерского сообщения для %s.", user_id)
+            return
+        existing_task.cancel()
+        manager_message_tasks.pop(user_id, None)
+
+    manager_pending_texts[user_id] = text
+
+    delay = MANAGER_MESSAGE_DELAY
+    if delay <= 0:
+        await _deliver_manager_message(user_id, text)
+        return
+
+    task = asyncio.create_task(_delayed_manager_message_send(user_id, delay))
+    manager_message_tasks[user_id] = task
+    logging.info("Менеджерское сообщение для %s отправится через %s секунд.", user_id, delay)
 
 
 # ====== CSV ======

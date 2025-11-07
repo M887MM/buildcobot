@@ -15,6 +15,7 @@ import types
 from dataclasses import dataclass
 from typing import Iterable
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -214,5 +215,28 @@ def run_smoke() -> None:
     print("search_products smoke-test passed.")
 
 
+def response_safety_smoke() -> None:
+    """Проверяет, что ответы LLM очищаются от цен и не становятся пустыми."""
+    fallback_ru = openai_func.PRICE_FALLBACK_LINES["ru"]
+
+    with patch.object(openai_func, "call_chat_with_fallback", return_value=("Цена 1000 ₽", "gpt")):
+        health_text = openai_func._build_health_response("у меня сыпь и зуд", "ru")
+        if not health_text or "цена" in health_text.lower():
+            raise SystemExit("Health-ответ содержит цену или пуст.")
+        if fallback_ru not in health_text:
+            raise SystemExit("Health-ответ не добавил fallback без цены.")
+
+    with patch.object(openai_func, "call_chat_with_fallback", return_value=("Стоимость 5000 рублей", "gpt")):
+        with patch.object(openai_func, "get_material_reference", return_value=None):
+            info_text = openai_func._build_informational_answer("что такое ретинол", "ru")
+            if not info_text or "стоим" in info_text.lower():
+                raise SystemExit("Информационный ответ содержит цену или пуст.")
+            if fallback_ru not in info_text:
+                raise SystemExit("Информационный ответ не добавил fallback без цены.")
+
+    print("response sanitization smoke-test passed.")
+
+
 if __name__ == "__main__":
     run_smoke()
+    response_safety_smoke()

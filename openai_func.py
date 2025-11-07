@@ -1893,7 +1893,7 @@ def _build_health_response(text: str, lang: str) -> str:
         if not answer:
             logger.debug("LLM provider %s вернул пустой health-ответ", provider)
             raise ValueError("empty health response")
-        return answer
+        return _sanitize_price_mentions(answer, lang)
     except Exception as error:
         logger.warning("Не удалось получить health-ответ: %s", error)
         fallback_map = {
@@ -1958,7 +1958,7 @@ def _build_informational_answer(text: str, lang: str) -> str:
         "5) завершай приглашением задать уточнения.\n"
         "Используй следующую справку по продуктам (не перечисляй её полностью, выбирай по смыслу запроса):\n"
         f"{MATERIAL_KNOWLEDGE_BASE}\n"
-        "Если вопрос о выборе, упомяни критерии: тип кожи, текстура, аромат, стойкость, бюджет. Не придумывай цены. "
+        "Если вопрос о выборе, упомяни критерии: тип кожи, текстура, аромат, стойкость, бюджет. Не упоминай цену или стоимость и не называй суммы. "
         "Не используй emoji, стикеры и Markdown-форматирование.\n"
         "Отвечай на языке пользователя; если не уверен, используй русский."
     )
@@ -1972,7 +1972,7 @@ def _build_informational_answer(text: str, lang: str) -> str:
         )
         cleaned = content.strip()
         if cleaned:
-            return cleaned
+            return _sanitize_price_mentions(cleaned, lang)
     except Exception as error:
         logger.warning("Не удалось получить информационный ответ от GPT: %s", error)
 
@@ -2356,31 +2356,83 @@ def format_product_text(product: ProductLike, lang: str) -> str:
         category_line = f"Kategoriya: {category}" if category else ""
         desc_line = description or "Mahsulot tavsifi keyinroq qo'shiladi."
         tags_line = f"Teglar: {tags}" if tags else ""
-        price_line = "Narx: menejer so'rov bo'yicha ma'lum qiladi."
     elif lang == "en":
         category_line = f"Category: {category}" if category else ""
         desc_line = description or "Description will be added later."
         tags_line = f"Tags: {tags}" if tags else ""
-        price_line = "Price: please contact the manager for details."
     elif lang == "kk":
         category_line = f"Санат: {category}" if category else ""
         desc_line = description or "Сипаттама кейінірек қосылады."
         tags_line = f"Тегтер: {tags}" if tags else ""
-        price_line = "Бағасы: менеджер сұраныс бойынша хабарлайды."
     else:  # ru
         category_line = f"Категория: {category}" if category else ""
         desc_line = description or "Описание появится позже."
         tags_line = f"Теги: {tags}" if tags else ""
-        price_line = "Стоимость: уточняйте у менеджера."
 
     parts = [f"🔹 {normalize_text(getattr(product, 'name', 'Товар')) or 'Товар'}"]
     if category_line:
         parts.append(category_line)
-    parts.append(price_line)
     parts.append(desc_line)
     if tags_line:
         parts.append(tags_line)
     return "\n".join(parts)
+
+
+PRICE_FALLBACK_LINES = {
+    "ru": "Условия обсуждаем индивидуально.",
+    "en": "We'll go over the final terms individually.",
+    "uz": "Yakuniy shartlarni alohida kelishamiz.",
+    "kk": "Қорытынды шарттарды жеке талқылаймыз.",
+}
+
+PRICE_WORD_PATTERN = re.compile(
+    r"\b("
+    r"цена|цену|ценой|цене|ценник|ценами|цены|стоимость|стоимости|стоимостью|"
+    r"прайс|price|prices|pricing|cost|costs|narx|narxi|narh|bahasi|bahosi|"
+    r"баға|бағасы|құны"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PRICE_VALUE_PATTERN = re.compile(
+    r"("
+    r"(?:[$€£¥₽₴₸₺₼₦₩₪₹]|руб(?:л(?:ей|я|ь|и)?)?|тенге|kzt|тг|tg|uzs|som|сум|byn|uah|amd|azn|aed|qar|sar|try|usd|eur|gbp)"
+    r"[\s:=]*\d[\d\s.,]*"
+    r"|"
+    r"\d[\d\s.,]*\s*(?:[$€£¥₽₴₸₺₼₦₩₪₹]|руб(?:л(?:ей|я|ь|и)?)?|тенге|kzt|тг|tg|uzs|som|сум|byn|uah|amd|azn|aed|qar|sar|try|usd|eur|gbp)"
+    r"|"
+    r"(?:цена|стоимость|price|cost|narx|bahasi|баға|бағасы|құны)\s*[:=]?\s*\d[\d\s.,]*"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_price_mentions(text: str, lang: str) -> str:
+    if not text:
+        return ""
+    fallback = PRICE_FALLBACK_LINES.get(lang, PRICE_FALLBACK_LINES["ru"])
+    filtered_lines: List[str] = []
+    removed_any = False
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if filtered_lines and filtered_lines[-1] != "":
+                filtered_lines.append("")
+            continue
+        normalized = stripped.lower()
+        if PRICE_WORD_PATTERN.search(normalized) or PRICE_VALUE_PATTERN.search(stripped):
+            removed_any = True
+            continue
+        filtered_lines.append(line)
+    while filtered_lines and filtered_lines[-1] == "":
+        filtered_lines.pop()
+    if not filtered_lines:
+        return fallback
+    cleaned_text = "\n".join(filtered_lines)
+    if removed_any and fallback and fallback not in cleaned_text:
+        return f"{cleaned_text}\n{fallback}"
+    return cleaned_text
 
 
 def build_summary_text(
@@ -2469,8 +2521,9 @@ def _generate_recommendation_message(
         "   N. Название — кратко опиши ключевой эффект или актив.\n"
         "   Как использовать: конкретные шаги применения (когда, в какой очередности, сколько). Добавь «Подходит: …», если можно описать тип кожи или задачу.\n"
         "   Предосторожности: что учесть (патч-тест, чувствительные зоны, сочетание с активами).\n"
-        "3) Заверши отдельным предложением «Стоимость уточняйте у менеджера.» и вопросом, приглашающим рассказать о состоянии кожи, аллергиях или рекомендациях врача.\n"
-        "Не придумывай новые товары и не указывай цену. Не давай медицинских диагнозов и не обещай излечения.\n"
+        "3) Заверши отдельным вопросом, приглашающим рассказать о состоянии кожи, аллергиях или рекомендациях врача. "
+        "Если нужно намекнуть на финальные условия, используй формулировку «Условия обсудим индивидуально.» без слов «цена» и «стоимость».\n"
+        "Не придумывай новые товары и не упоминай цену, стоимость, валюты или конкретные суммы. Не давай медицинских диагнозов и не обещай излечения.\n"
         "Лимиты: до 6 предложений и до 3 блоков рекомендаций, каждая строка не длиннее 120 символов."
     )
     if profile_hint:
@@ -2494,7 +2547,7 @@ def _generate_recommendation_message(
         if not recommendation:
             logger.debug("LLM provider %s вернул пустую рекомендацию", provider)
             return None
-        return recommendation
+        return _sanitize_price_mentions(recommendation, lang)
     except Exception as error:
         logger.warning("Не удалось построить консультацию LLM: %s", error)
         return None
