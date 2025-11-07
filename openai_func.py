@@ -2164,7 +2164,19 @@ def tokenize(query: str) -> List[str]:
     base_tokens = [token for token in re.findall(r"[a-zа-я0-9]+", query.lower()) if len(token) > 2]
     if not base_tokens:
         return base_tokens
-    return _expand_tokens(base_tokens)
+
+    expanded = _expand_tokens(base_tokens)
+    normalized_tokens: List[str] = []
+    seen: set[str] = set()
+    for token in expanded:
+        normalized = token.lower().replace("ё", "е")
+        for candidate in (normalized, _normalize_category_token(normalized)):
+            if not candidate:
+                continue
+            if candidate not in seen:
+                normalized_tokens.append(candidate)
+                seen.add(candidate)
+    return normalized_tokens
 
 
 def _token_variants(token: str) -> set[str]:
@@ -2371,47 +2383,13 @@ def format_product_text(product: ProductLike, lang: str) -> str:
     return "\n".join(parts)
 
 
-def build_summary_text(products: List[ProductLike], lang: str, price_limit: Optional[int], total_count: Optional[int] = None) -> str:
-    count = total_count if total_count is not None else len(products)
-
-    templates = {
-        "ru": (
-            f"🔎 Нашёл {count} подходящих решений. Ниже короткое описание каждого варианта.",
-            "Если нужен расчёт доставки или подбор аналогов — напишите.",
-        ),
-        "uz": (
-            f"🔎 {count} mos variant topildi. Quyida qisqacha tavsifi bor.",
-            "Yetkazib berish yoki o'xshash mahsulotlar kerak bo'lsa, yozing.",
-        ),
-        "en": (
-            f"🔎 Found {count} matching items. See the details below.",
-            "Let me know if you need delivery calculation or alternative products.",
-        ),
-        "kk": (
-            f"🔎 {count} сәйкес шешім табылды. Толық ақпарат төменде.",
-            "Жеткізу есебін немесе балама тауарларды қажет етсеңіз, хабарлаңыз.",
-        ),
-    }
-    header, footer = templates.get(lang, templates["ru"])
-
-    if price_limit:
-        price_line = {
-            "ru": "Бюджет учтён — подберу решения без озвучивания стоимости.",
-            "uz": "Byudjetni inobatga oldim — narxni aytmay tavsiyalar beraman.",
-            "en": "Budget noted — recommendations stay price-free.",
-            "kk": "Бюджет ескерілді — баға айтпай ұсынамын.",
-        }[lang]
-    else:
-        price_line = ""
-
-    lines = [header]
-    if price_line:
-        lines.append(price_line)
-    lines.append(footer)
-    if total_count and total_count > len(products):
-        lines.append("")
-        lines.append("Напишите «ещё», чтобы показать следующие позиции.")
-    return "\n".join(lines)
+def build_summary_text(
+    products: List[ProductLike],
+    lang: str,
+    price_limit: Optional[int],
+    total_count: Optional[int] = None,
+) -> str:
+    return ""
 
 
 def _serialize_product(product: ProductLike, lang: str, index_map: dict[int, int]) -> dict:
