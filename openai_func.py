@@ -486,6 +486,99 @@ SYNONYM_EXACT = {
     "губы": {"помада", "бальзам", "блеск", "тинт", "lip", "balm", "gloss"},
     "тональный": {"foundation", "тональник", "bb", "cc", "кушон"},
 }
+GENERAL_TOKEN_ALIASES = {
+    "тоналка": "тональный",
+    "tonalka": "тональный",
+    "tonic": "тоник",
+    "тональник": "тональный",
+    "тончик": "тональный",
+    "тончико": "тональный",
+    "тон": "тональный",
+    "тонка": "тональный",
+    "кремчик": "крем",
+    "кремик": "крем",
+    "kremchik": "крем",
+    "масочка": "маска",
+    "масочку": "маска",
+    "maskochka": "маска",
+    "скрабик": "скраб",
+    "скрабику": "скраб",
+    "scrabik": "скраб",
+    "сыворка": "сыворотка",
+    "сывороточка": "сыворотка",
+    "syvorotka": "сыворотка",
+    "spfka": "spf",
+    "санскринчик": "санскрин",
+    "санкремчик": "санскрин",
+    "sancreme": "санскрин",
+    "кондер": "кондиционер",
+    "кондишн": "кондиционер",
+    "kondishn": "кондиционер",
+    "бальзамчик": "бальзам",
+    "блескдлягуб": "блеск",
+    "lippy": "lipstick",
+    "lippe": "lipstick",
+    "parfyumka": "парфюм",
+    "парфюмка": "парфюм",
+    "аромик": "аромат",
+    "pomadka": "помада",
+    "помадка": "помада",
+    "тинтик": "тинт",
+    "шампунька": "шампунь",
+    "шампунчик": "шампунь",
+    "shampunka": "шампунь",
+    "гельчик": "гель",
+    "тонерчик": "тонер",
+    "тонерок": "тонер",
+    "spf50": "spf",
+    "spf30": "spf",
+    "spf15": "spf",
+}
+DIMINUTIVE_BASES = {
+    "крем": "крем",
+    "крема": "крем",
+    "маск": "маска",
+    "маска": "маска",
+    "скраб": "скраб",
+    "сыворот": "сыворотка",
+    "сыворотк": "сыворотка",
+    "гель": "гель",
+    "туш": "тушь",
+    "тушь": "тушь",
+    "шампун": "шампунь",
+    "бальзам": "бальзам",
+    "тонер": "тонер",
+    "тонал": "тональный",
+    "санскрин": "санскрин",
+    "санкрем": "санскрин",
+    "помад": "помада",
+    "тинт": "тинт",
+    "аромат": "аромат",
+    "парфюм": "парфюм",
+    "spf": "spf",
+    "mask": "mask",
+    "cream": "cream",
+    "serum": "serum",
+    "balm": "balm",
+}
+DIMINUTIVE_SUFFIXES = (
+    "чик",
+    "щик",
+    "ик",
+    "ник",
+    "чка",
+    "шка",
+    "ушка",
+    "юшка",
+    "очка",
+    "ечка",
+    "улька",
+    "уля",
+    "юля",
+    "чико",
+    "икс",
+    "шк",
+)
 
 PRODUCT_PAGE_SIZE = 4
 
@@ -1735,8 +1828,25 @@ def _combine_blocks(*parts: Optional[str]) -> str:
     return "\n\n".join(blocks)
 
 
-def _normalize_category_token(token: str) -> str:
+def _canonicalize_general_token(token: str) -> str:
     base = token.lower().replace("ё", "е")
+    alias = GENERAL_TOKEN_ALIASES.get(base)
+    if alias:
+        return alias
+    for suffix in DIMINUTIVE_SUFFIXES:
+        if base.endswith(suffix) and len(base) - len(suffix) >= 3:
+            root = base[: -len(suffix)]
+            mapped = GENERAL_TOKEN_ALIASES.get(root)
+            if mapped:
+                return mapped
+            root_mapped = DIMINUTIVE_BASES.get(root)
+            if root_mapped:
+                return root_mapped
+    return base
+
+
+def _normalize_category_token(token: str) -> str:
+    base = _canonicalize_general_token(token)
     alias = CATEGORY_TOKEN_ALIASES.get(base)
     if alias:
         return alias
@@ -1751,7 +1861,11 @@ def _normalize_query(text: str) -> str:
 
 
 def _tokenize_simple(text: str) -> List[str]:
-    return [token.replace("ё", "е") for token in re.findall(r"[a-zа-я0-9]+", text.lower()) if token]
+    return [
+        _canonicalize_general_token(token)
+        for token in re.findall(r"[a-zа-я0-9]+", text.lower())
+        if token
+    ]
 
 
 def _expand_token_set(tokens: Iterable[str]) -> set[str]:
@@ -1760,7 +1874,7 @@ def _expand_token_set(tokens: Iterable[str]) -> set[str]:
     seen: set[str] = set()
     for token in tokens:
         if token:
-            queue.append(token.replace("ё", "е"))
+            queue.append(_canonicalize_general_token(token))
 
     prefix_strips = ("для", "про", "под", "по")
 
@@ -1775,16 +1889,19 @@ def _expand_token_set(tokens: Iterable[str]) -> set[str]:
         if len(normalized) > 2:
             expanded.add(normalized)
         for variant in _token_variants(raw):
-            if variant and variant not in seen:
-                queue.append(variant)
+            if not variant:
+                continue
+            normalized_variant = _canonicalize_general_token(variant)
+            if normalized_variant and normalized_variant not in seen:
+                queue.append(normalized_variant)
         for prefix in prefix_strips:
             if raw.startswith(prefix) and len(raw) - len(prefix) >= 3:
-                stripped = raw[len(prefix):]
-                if stripped not in seen:
+                stripped = _canonicalize_general_token(raw[len(prefix):])
+                if stripped and stripped not in seen:
                     queue.append(stripped)
             if raw.startswith(prefix + "-") and len(raw) - len(prefix) - 1 >= 3:
-                stripped = raw[len(prefix) + 1 :]
-                if stripped not in seen:
+                stripped = _canonicalize_general_token(raw[len(prefix) + 1 :])
+                if stripped and stripped not in seen:
                     queue.append(stripped)
         for prefix, synonyms in SYNONYM_PREFIXES.items():
             if normalized.startswith(prefix):
@@ -2202,7 +2319,7 @@ def _expand_tokens(tokens: List[str]) -> List[str]:
     expanded: List[str] = []
     seen = set()
     for token in tokens:
-        normalized = token.replace("ё", "е")
+        normalized = _canonicalize_general_token(token)
         if normalized not in seen:
             expanded.append(normalized)
             seen.add(normalized)
@@ -2231,7 +2348,7 @@ def tokenize(query: str) -> List[str]:
     normalized_tokens: List[str] = []
     seen: set[str] = set()
     for token in expanded:
-        normalized = token.lower().replace("ё", "е")
+        normalized = _canonicalize_general_token(token)
         for candidate in (normalized, _normalize_category_token(normalized)):
             if not candidate:
                 continue
