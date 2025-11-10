@@ -341,6 +341,74 @@ GREETING_RESPONSES = {
     "kk": "👋 Сәлем! Косметика, күтім және хош иістерді таңдауға көмектесемін. Қандай мақсатқа немесе кімге сыйлық керек екенін айтыңыз.",
 }
 
+GREETING_PHRASES = {
+    "привет",
+    "приветик",
+    "приветствую",
+    "здравствуй",
+    "здравствуйте",
+    "салют",
+    "хай",
+    "hi",
+    "hi there",
+    "hello",
+    "hey",
+    "hey there",
+    "hola",
+    "ciao",
+    "salem",
+    "салем",
+    "сәлем",
+    "салеметсизбе",
+    "ассаламу алейкум",
+    "ассалам алейкум",
+    "ассалому алайкум",
+    "салам алейкум",
+    "assalamu alaikum",
+    "assalomu alaykum",
+    "salom",
+    "yo",
+}
+GREETING_TOKEN_POOL = {
+    "привет",
+    "приветик",
+    "приветствую",
+    "здравствуй",
+    "здравствуйте",
+    "салют",
+    "хай",
+    "hi",
+    "hello",
+    "hey",
+    "hola",
+    "ciao",
+    "yo",
+    "salem",
+    "салем",
+    "сәлем",
+    "салеметсизбе",
+    "ассаламу",
+    "ассалам",
+    "ассалому",
+    "салам",
+    "алейкум",
+    "алайкум",
+    "alaikum",
+    "alaykum",
+    "assalamu",
+    "assalomu",
+    "salom",
+    "добрый",
+    "доброе",
+    "доброго",
+    "утро",
+    "день",
+    "вечер",
+    "ночи",
+}
+MAX_GREETING_TOKEN_COUNT = 4
+FORWARDED_HEADER_PATTERN = re.compile(r"^[^,\n]+,\s*\[\d{1,2}\.\d{1,2}\.\d{4}")
+
 MATERIAL_KNOWLEDGE_BASE = (
     "Уход за кожей: очищение, тонизация, увлажнение, SPF, активы (витамин C, AHA, ретинол).\n"
     "Макияж: базы, тональные основы, корректоры, тени, тушь, румяна, фиксаторы и аксессуары.\n"
@@ -1984,13 +2052,56 @@ LOW_INFO_KEYWORDS = {
 }
 
 
+def _iter_forward_content_lines(text: str) -> Iterable[str]:
+    if not text:
+        return
+    for raw_line in text.splitlines():
+        line = (raw_line or '').strip()
+        if not line:
+            continue
+        if FORWARDED_HEADER_PATTERN.match(line):
+            continue
+        yield line
+
+
+def _extract_user_phrase(text: str) -> str:
+    last_line = ''
+    for line in _iter_forward_content_lines(text):
+        last_line = line
+    if last_line:
+        return last_line
+    return (text or '').strip()
+
+
+def _is_greeting_message(text: str) -> bool:
+    for line in _iter_forward_content_lines(text):
+        normalized = _normalize_query(line)
+        if not normalized:
+            continue
+        condensed = re.sub(r'[^a-zа-я0-9\s]+', ' ', normalized).strip()
+        if not condensed:
+            continue
+        if condensed in GREETING_PHRASES:
+            return True
+        tokens = [token for token in _tokenize_simple(condensed) if token]
+        if not tokens or len(tokens) > MAX_GREETING_TOKEN_COUNT:
+            continue
+        if all((token in GREETING_TOKEN_POOL) or token.isdigit() for token in tokens):
+            return True
+    return False
+
+
 def _is_low_information_query(text: str) -> bool:
-    normalized = _normalize_query(text)
+    if _is_greeting_message(text):
+        return False
+
+    core_phrase = _extract_user_phrase(text)
+    normalized = _normalize_query(core_phrase)
     if not normalized:
         return True
 
     stripped = normalized.strip()
-    tokens = _tokenize_simple(text)
+    tokens = _tokenize_simple(core_phrase)
     compact = re.sub(r"[^a-zа-я0-9]+", "", stripped)
 
     if stripped in LOW_INFO_KEYWORDS or compact in LOW_INFO_KEYWORDS:
@@ -3523,6 +3634,16 @@ async def ask_openai_sync(user_id: int, text: str, bot: Bot = None, chat_id: int
     usage_response_text: Optional[str] = None
     if usage_requested:
         usage_response_text = await fetch_usage_guidance(text, lang)
+
+    if _is_greeting_message(text):
+        _reset_product_session(user_id)
+        greeting_text = _build_greeting_response(lang)
+        combined = _combine_blocks(greeting_text, health_guidance)
+        return {
+            "text": combined or greeting_text,
+            "products": [],
+            "meta": {"display_text": True, "continuation": False, "greeting": True},
+        }
 
     if _is_availability_followup(normalized_query, simple_tokens, lang):
         followup_payload = _handle_availability_followup(user_id, lang)
