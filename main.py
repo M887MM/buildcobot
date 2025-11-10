@@ -71,6 +71,17 @@ WELCOME_MESSAGE = (
 )
 
 MANAGER_MESSAGE_DELAY = _get_manager_message_delay()
+def _get_product_refresh_interval() -> int:
+    raw = os.getenv("PRODUCT_REFRESH_INTERVAL", "600")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logging.warning("Некорректное значение PRODUCT_REFRESH_INTERVAL='%s', используем 600 секунд.", raw)
+        return 600
+    return max(0, value)
+
+
+PRODUCT_REFRESH_INTERVAL = _get_product_refresh_interval()
 
 GOODS_OVERVIEW_TEXT = (
     "🛍️ Направления бутика LuxeBeauty:\n"
@@ -113,6 +124,25 @@ async def load_products():
         logging.exception("Ошибка загрузки товаров из БД: %s", exc)
         return
     logging.info("Загружено товаров: %d", len(Products))
+
+
+async def refresh_products_periodically():
+    if PRODUCT_REFRESH_INTERVAL <= 0:
+        return
+    while True:
+        try:
+            await asyncio.sleep(PRODUCT_REFRESH_INTERVAL)
+            await load_products()
+            try:
+                openai_func.invalidate_products_cache()
+            except Exception:
+                logging.exception("Не удалось сбросить кеш товаров в openai_func после обновления.")
+            logging.info("Плановое обновление витрины завершено.")
+        except asyncio.CancelledError:
+            logging.info("Фоновое обновление витрины остановлено.")
+            break
+        except Exception:
+            logging.exception("Ошибка в фоновом обновлении витрины, повтор через %d сек.", PRODUCT_REFRESH_INTERVAL)
 
 
 def build_product_entry(item, idx: int, placeholder_photo: str) -> dict:
@@ -1070,8 +1100,17 @@ async def handle_question(message: Message, state: FSMContext):
 # ====== Запуск бота ======
 async def main():
     await load_products()
+    product_refresh_task = None
+    if PRODUCT_REFRESH_INTERVAL > 0:
+        product_refresh_task = asyncio.create_task(refresh_products_periodically())
     logging.info("Бот загружен и готов. Запуск polling...")
     async def _shutdown():
+        if product_refresh_task:
+            product_refresh_task.cancel()
+            try:
+                await product_refresh_task
+            except asyncio.CancelledError:
+                pass
         storage = getattr(dp, "storage", None)
         if storage:
             for method_name in ("close", "wait_closed"):

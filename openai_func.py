@@ -620,12 +620,12 @@ PRODUCT_PAGE_SIZE = 4
 
 
 def _get_product_cache_ttl() -> int:
-    raw = os.getenv("PRODUCT_CACHE_TTL", "60")
+    raw = os.getenv("PRODUCT_CACHE_TTL", "10")
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        logger.warning("Некорректное значение PRODUCT_CACHE_TTL='%s', используем 60 секунд.", raw)
-        return 60
+        logger.warning("Некорректное значение PRODUCT_CACHE_TTL='%s', используем 10 секунд.", raw)
+        return 10
     return max(0, value)
 
 
