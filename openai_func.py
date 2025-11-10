@@ -203,42 +203,10 @@ INTENT_KEYWORDS = {
     "default": {"store", "beauty", "cosmetic", "cosmetics"},
 }
 NO_MATCH_RESPONSES = {
-    "ru": (
-        "🚫 По запросу «{query}» подходящих средств не нашёл.\n"
-        "Расскажите подробнее:\n"
-        "🔸 уход за кожей (кремы, сыворотки, SPF)\n"
-        "🔸 макияж (тональные основы, тени, тушь)\n"
-        "🔸 ароматы и подарочные наборы\n"
-        "🔸 уход за волосами и аксессуары\n"
-        "Уточните тип кожи, повод или бюджет — подберу варианты и доставку."
-    ),
-    "uz": (
-        "🚫 \"{query}\" bo‘yicha mos kosmetika topilmadi.\n"
-        "Batafsil yozing:\n"
-        "🔸 teri parvarishi (krem, sarum, SPF)\n"
-        "🔸 makiyaj (tonal krem, ten, tush)\n"
-        "🔸 atirlar va sovg‘a to‘plamlari\n"
-        "🔸 soch parvarishi va aksessuarlar\n"
-        "Teri turi, byudjet yoki voqeani ko‘rsating — mos variantlarni tavsiya qilaman."
-    ),
-    "en": (
-        "🚫 I couldn't find beauty products for “{query}”.\n"
-        "Let me know more:\n"
-        "🔸 skincare (creams, serums, SPF)\n"
-        "🔸 makeup (foundations, palettes, mascara)\n"
-        "🔸 fragrances and gift sets\n"
-        "🔸 hair care and accessories\n"
-        "Share skin type, occasion, or budget and I’ll suggest options with delivery."
-    ),
-    "kk": (
-        "🚫 \"{query}\" сұрауына сәйкес косметика табылмады.\n"
-        "Толығырақ жазыңыз:\n"
-        "🔸 тері күтімі (крем, сарысу, SPF)\n"
-        "🔸 макияж (тон, тень, тушь)\n"
-        "🔸 хош иістер мен сыйлық жиынтықтар\n"
-        "🔸 шаш күтімі және аксессуарлар\n"
-        "Тері түрі, жағдай немесе бюджет жайлы айтыңыз — лайықты нұсқалар ұсынамын."
-    ),
+    "ru": "😔 Данный товар, к сожалению, временно отсутствует.",
+    "uz": "😔 Bu mahsulot hozircha mavjud emas.",
+    "en": "😔 This item is temporarily out of stock.",
+    "kk": "😔 Бұл тауар, өкінішке қарай, уақытша жоқ.",
 }
 LOW_INFO_RESPONSES = {
     "ru": (
